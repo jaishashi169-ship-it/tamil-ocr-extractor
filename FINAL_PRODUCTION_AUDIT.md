@@ -5,7 +5,7 @@
 ## Audit Metadata
 - **Date:** 2026-11-14
 - **Workspace:** `e:\AI WEB Application Development lists\Tamil OCR Extractor`
-- **Source Revision:** Git commit `0144358c12b574efd6545028723179e749e53452` (local baseline, `.gitignore` excludes secrets/caches/uploads)
+- **Source Revision:** Code baseline `0144358c12b574efd6545028723179e749e53452`; final release/audit commit tagged `audit-baseline-v1` on `master` (see `git rev-parse HEAD`)
 - **Audit Environment:** Windows host; Python `3.12.10`, FastAPI `0.115.6`, SQLAlchemy `2.0.37`, Celery `5.4.0`, Kombu `5.7.0`, PyMuPDF `1.25.2`, Next.js `15.5.29`, React `19.0.0`, TypeScript `5.7.3`
 - **Host External Dependencies Absent:** `docker` / `docker compose`, `tesseract` (`tam` + `eng`), `soffice` (LibreOffice), `redis-server`, `GEMINI_API_KEY` / `OPENAI_API_KEY`
 
