@@ -1,0 +1,37 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+email-validator==2.2.0
+pydantic-settings==2.7.1
+sqlalchemy==2.0.37
+alembic==1.14.1
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+celery==5.4.0
+redis==5.2.1
+python-multipart==0.0.20
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+boto3==1.35.95
+aiofiles==24.1.0
+
+# Document & Image Processing
+PyMuPDF==1.25.2
+pytesseract==0.3.13
+Pillow==11.1.0
+opencv-python-headless==4.11.0.86
+numpy==2.2.1
+python-docx==1.1.2
+psd-tools==1.10.4
+openpyxl==3.1.5
+reportlab==4.2.5
+beautifulsoup4==4.12.3
+bleach==6.2.0
+markdown==3.7
+charset-normalizer==3.4.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+httpx==0.28.1

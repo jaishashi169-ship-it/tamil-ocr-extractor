@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-page: #f8fafc;
+  --bg-card: #ffffff;
+  --text-primary: #0f172a;
+}
+
+.dark {
+  --bg-page: #0b1120;
+  --bg-card: #111827;
+  --text-primary: #f1f5f9;
+}
+
+body {
+  background-color: var(--bg-page);
+  color: var(--text-primary);
+  font-feature-settings: "kern" 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

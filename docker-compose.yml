@@ -1,0 +1,147 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: studio_dev_password
+      POSTGRES_DB: tamil_doc_studio
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d tamil_doc_studio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: replace-with-minio-secret
+    volumes:
+      - minio_data:/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://studio:studio_dev_password@postgres:5432/tamil_doc_studio
+      SYNC_DATABASE_URL: postgresql+psycopg2://studio:studio_dev_password@postgres:5432/tamil_doc_studio
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      ALLOW_BACKGROUND_TASK_FALLBACK: "false"
+      LOCAL_STORAGE_ROOT: /data/private_storage
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --limit-max-requests 1000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - private_storage:/data/private_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal_net
+      - public_net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://studio:studio_dev_password@postgres:5432/tamil_doc_studio
+      SYNC_DATABASE_URL: postgresql+psycopg2://studio:studio_dev_password@postgres:5432/tamil_doc_studio
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      ALLOW_BACKGROUND_TASK_FALLBACK: "false"
+      LOCAL_STORAGE_ROOT: /data/private_storage
+    command: ["celery", "-A", "app.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    volumes:
+      - private_storage:/data/private_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Isolated on internal-only network (no external internet egress)
+    networks:
+      - internal_net
+    mem_limit: 2048m
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -t 5 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+        NEXT_PUBLIC_MAX_UPLOAD_BYTES: ${NEXT_PUBLIC_MAX_UPLOAD_BYTES:-500000000}
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+      NEXT_PUBLIC_MAX_UPLOAD_BYTES: ${NEXT_PUBLIC_MAX_UPLOAD_BYTES:-500000000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - public_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  internal_net:
+    driver: bridge
+    internal: true
+  public_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  private_storage:
