@@ -5,7 +5,7 @@
 ## Audit Metadata
 - **Date:** 2026-11-14
 - **Workspace:** `e:\AI WEB Application Development lists\Tamil OCR Extractor`
-- **Source Revision:** Unversioned workspace (not a `.git` repository); packaged in `tamil-english-document-studio-source.zip`
+- **Source Revision:** Git commit `0144358c12b574efd6545028723179e749e53452` (local baseline, `.gitignore` excludes secrets/caches/uploads)
 - **Audit Environment:** Windows host; Python `3.12.10`, FastAPI `0.115.6`, SQLAlchemy `2.0.37`, Celery `5.4.0`, Kombu `5.7.0`, PyMuPDF `1.25.2`, Next.js `15.5.29`, React `19.0.0`, TypeScript `5.7.3`
 - **Host External Dependencies Absent:** `docker` / `docker compose`, `tesseract` (`tam` + `eng`), `soffice` (LibreOffice), `redis-server`, `GEMINI_API_KEY` / `OPENAI_API_KEY`
 
@@ -16,7 +16,8 @@
 - **[PASS]** `.env.example` documents all required settings (`APP_ENV`, `SECRET_KEY`, `DATABASE_URL`, `SYNC_DATABASE_URL`, `REDIS_*`, `ALLOW_BACKGROUND_TASK_FALLBACK`, `JOB_LEASE_SECONDS`, `STORAGE_*`, `GEMINI_API_KEY`, `OPENAI_API_KEY`) without secrets.
 - **[PASS]** Production rejects insecure placeholder `SECRET_KEY` and short secrets (`<32` chars) via `Settings.validate_production_safety()` (`test_production_rejects_placeholder_secret`).
 - **[PASS]** Fresh-database Alembic migrations verified: `alembic upgrade head` on a brand-new SQLite DB cleanly ran `0001_initial -> 0002_worker_ownership (head)`.
-- **[BLOCKED]** Clean Docker image builds (`backend/Dockerfile`, `frontend/Dockerfile`) and in-container verification of `tesseract-ocr` (`tam` + `eng`), Noto Sans Tamil fonts, and `libreoffice-writer` (`docker` not installed on host).
+- **[PASS (Static Inspection)]** `backend/Dockerfile` installs `tesseract-ocr`, `tesseract-ocr-tam`, `tesseract-ocr-eng`, `libreoffice-writer`, `poppler-utils`, `fonts-noto-core`, and `fonts-noto-extra` under non-root `appuser`. `frontend/Dockerfile` uses `npm ci` and accepts build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_MAX_UPLOAD_BYTES` args, wired from `docker-compose.yml` (`build.args`) with healthchecks on `postgres`, `redis`, `minio`, `backend`, `worker`, and `frontend`.
+- **[BLOCKED]** Clean Docker image builds and live container execution on a Docker host (`docker` not installed on this Windows host).
 
 ## 2. Authentication and File Security
 - **[PASS]** Guest/register/login JWT auth and cross-user isolation verified (`test_streamed_upload_boundary_resumability_auth_and_sha256`: User B receives `404` on User A's uploads and jobs).
