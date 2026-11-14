@@ -80,7 +80,7 @@ export function OptionsStep({
           <label className="block text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">
             {t(locale, "languageLabel")}
           </label>
-          <div className="grid grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
             {[
               { id: "tam" as OcrLanguage, label: t(locale, "langTamil") },
               { id: "eng" as OcrLanguage, label: t(locale, "langEnglish") },
@@ -126,7 +126,7 @@ export function OptionsStep({
           <label className="block text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">
             {t(locale, "qualityLabel")}
           </label>
-          <div className="grid grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
             {[
               { id: "high" as QualityPreset, label: t(locale, "qualityHigh") },
               { id: "balanced" as QualityPreset, label: t(locale, "qualityBalanced") },

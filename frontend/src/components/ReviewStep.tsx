@@ -396,8 +396,8 @@ export function ReviewStep({
         </div>
       )}
 
-      {/* Mobile Tabs */}
-      <div className="flex rounded-xl bg-slate-200/70 p-1 sm:hidden dark:bg-slate-800">
+      {/* Mobile / Tablet Tabs */}
+      <div className="flex rounded-xl bg-slate-200/70 p-1 lg:hidden dark:bg-slate-800">
         <button
           type="button"
           onClick={() => setMobileTab("original")}
@@ -435,7 +435,7 @@ export function ReviewStep({
             )}
           </div>
 
-          <div className="h-[460px] overflow-auto rounded-xl border border-slate-100 bg-slate-50 p-3 flex items-start justify-center dark:border-slate-800 dark:bg-slate-950">
+          <div className="h-[340px] sm:h-[460px] overflow-auto rounded-xl border border-slate-100 bg-slate-50 p-3 flex items-start justify-center dark:border-slate-800 dark:bg-slate-950">
             {previewUrl ? (
               <img
                 src={previewUrl}
@@ -474,8 +474,8 @@ export function ReviewStep({
         {/* Right: Editable Extracted Text */}
         <div
           className={`${
-            mobileTab === "extracted" ? "block" : "hidden"
-          } lg:block rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900 flex flex-col`}
+            mobileTab === "extracted" ? "flex" : "hidden"
+          } lg:flex flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900`}
         >
           <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
             <span>
