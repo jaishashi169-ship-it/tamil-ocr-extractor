@@ -504,3 +504,185 @@ def test_compression_presets_and_export_file_opening():
         elif fmt == "xlsx":
             wb = openpyxl.load_workbook(io.BytesIO(dl.content))
             assert len(wb.sheetnames) >= 1
+
+
+def test_direct_s3_multipart_upload_and_presigned_downloads():
+    headers = _auth_headers()
+    img = Image.new("RGB", (64, 64), "white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    expected_sha = hashlib.sha256(png_bytes).hexdigest()
+
+    from app.routers import exports as exports_router
+    from app.routers import uploads as uploads_router
+
+    with (
+        patch.object(uploads_router.storage, "is_s3", return_value=True),
+        patch.object(uploads_router.storage, "create_multipart_upload", return_value="s3-up-123") as mock_create_mpu,
+        patch.object(
+            uploads_router.storage,
+            "presign_upload_part",
+            return_value="https://s3.example.com/bucket/key?partNumber=1&X-Amz-Signature=abc",
+        ) as mock_presign_part,
+        patch.object(uploads_router.storage, "complete_multipart_upload") as mock_complete_mpu,
+        patch.object(uploads_router.storage, "abort_multipart_upload") as mock_abort_mpu,
+        patch.object(uploads_router.storage, "head_object_size", return_value=len(png_bytes)),
+        patch.object(uploads_router.storage, "read_head_bytes", return_value=png_bytes[:64]),
+        patch.object(uploads_router.storage, "compute_sha256_streaming", return_value=(len(png_bytes), expected_sha)),
+        patch.object(exports_router.storage, "is_s3", return_value=True),
+        patch.object(
+            exports_router.storage,
+            "presign_download_url",
+            return_value="https://s3.example.com/bucket/export.txt?X-Amz-Signature=dl123",
+        ) as mock_presign_dl,
+        patch.object(exports_router.storage, "save_bytes", return_value=256),
+        patch.object(exports_router.storage, "read_bytes", return_value=b"sample-export-bytes"),
+    ):
+        # 1. Init S3 multipart session
+        init_res = client.post(
+            "/api/v1/uploads/init",
+            json={
+                "filename": "direct.png",
+                "expected_size_bytes": len(png_bytes),
+                "chunk_size_bytes": 65_536,
+            },
+            headers=headers,
+        )
+        assert init_res.status_code == 201, init_res.text
+        body = init_res.json()
+        assert body["upload_mode"] == "direct_s3"
+        sid = body["session_id"]
+        mock_create_mpu.assert_called_once()
+
+        # 2. Presign part URL
+        part_url_res = client.get(f"/api/v1/uploads/{sid}/part-url/0", headers=headers)
+        assert part_url_res.status_code == 200, part_url_res.text
+        assert part_url_res.json()["part_number"] == 1
+        assert part_url_res.json()["upload_url"].startswith("https://s3.example.com/")
+        mock_presign_part.assert_called_once()
+
+        # 3. Register uploaded part ETag
+        reg_res = client.post(
+            f"/api/v1/uploads/{sid}/parts/0",
+            json={"etag": '"etag-part-1"'},
+            headers=headers,
+        )
+        assert reg_res.status_code == 200, reg_res.text
+        assert reg_res.json()["received_chunks"] == [0]
+
+        # 4. Status reflects direct_s3
+        status_res = client.get(f"/api/v1/uploads/{sid}", headers=headers)
+        assert status_res.status_code == 200
+        assert status_res.json()["upload_mode"] == "direct_s3"
+        assert status_res.json()["received_chunks"] == [0]
+
+        # 5. Complete S3 multipart upload
+        comp_res = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
+        assert comp_res.status_code == 200, comp_res.text
+        assert comp_res.json()["status"] == "completed"
+        assert comp_res.json()["sha256_hash"] == expected_sha
+        mock_complete_mpu.assert_called_once()
+
+        # 6. Abort an in-progress S3 session calls abort_multipart_upload
+        abort_init = client.post(
+            "/api/v1/uploads/init",
+            json={
+                "filename": "abort_me.png",
+                "expected_size_bytes": len(png_bytes),
+                "chunk_size_bytes": 65_536,
+            },
+            headers=headers,
+        ).json()
+        del_res = client.delete(f"/api/v1/uploads/{abort_init['session_id']}", headers=headers)
+        assert del_res.status_code == 204
+        mock_abort_mpu.assert_called_once()
+
+        # 7. Reject oversized S3 object (> 500 MB) and invalid magic bytes
+        oversize_init = client.post(
+            "/api/v1/uploads/init",
+            json={
+                "filename": "huge.png",
+                "expected_size_bytes": len(png_bytes),
+                "chunk_size_bytes": 65_536,
+            },
+            headers=headers,
+        ).json()
+        osid = oversize_init["session_id"]
+        client.post(f"/api/v1/uploads/{osid}/parts/0", json={"etag": '"e1"'}, headers=headers)
+        with patch.object(uploads_router.storage, "head_object_size", return_value=get_settings().MAX_UPLOAD_BYTES + 1):
+            over_res = client.post(f"/api/v1/uploads/{osid}/complete", headers=headers)
+            assert over_res.status_code == 413
+
+        bad_init = client.post(
+            "/api/v1/uploads/init",
+            json={
+                "filename": "spoof.png",
+                "expected_size_bytes": len(png_bytes),
+                "chunk_size_bytes": 65_536,
+            },
+            headers=headers,
+        ).json()
+        bsid = bad_init["session_id"]
+        client.post(f"/api/v1/uploads/{bsid}/parts/0", json={"etag": '"e1"'}, headers=headers)
+        with patch.object(uploads_router.storage, "read_head_bytes", return_value=b"NOT_A_VALID_PNG_HEADER"):
+            bad_res = client.post(f"/api/v1/uploads/{bsid}/complete", headers=headers)
+            assert bad_res.status_code == 415
+
+        # 8. Presigned download links for original, export, and batch zip
+        job_res = client.post(
+            "/api/v1/jobs",
+            json={"upload_session_id": sid, "settings": {"language_mode": "tamil_english"}},
+            headers=headers,
+        )
+        assert job_res.status_code == 201, job_res.text
+        jid = job_res.json()["job_id"]
+
+        orig_link = client.get(f"/api/v1/jobs/{jid}/original/link", headers=headers)
+        assert orig_link.status_code == 200
+        assert orig_link.json()["direct_storage"] is True
+        assert orig_link.json()["download_url"].startswith("https://s3.example.com/")
+
+        with SessionLocal() as db:
+            from app.models import ExportArtifact
+            job_row = db.query(Job).filter(Job.id == jid).first()
+            assert job_row is not None
+            job_row.status = "completed"
+            db.add(
+                PageResult(
+                    job_id=jid,
+                    page_number=1,
+                    raw_text="Direct S3 Test",
+                    edited_text="Direct S3 Test",
+                    language_detected="en",
+                    confidence_avg=0.99,
+                    extraction_method="direct",
+                )
+            )
+            art = ExportArtifact(
+                job_id=jid,
+                user_id=job_row.user_id,
+                export_format="txt",
+                quality_preset="high",
+                storage_key=f"jobs/{jid}/exports/test.txt",
+                file_size_bytes=19,
+            )
+            db.add(art)
+            db.commit()
+            db.refresh(art)
+            art_id = art.id
+
+        exp_link = client.get(f"/api/v1/jobs/{jid}/exports/{art_id}/link", headers=headers)
+        assert exp_link.status_code == 200
+        assert exp_link.json()["direct_storage"] is True
+        assert exp_link.json()["download_url"].startswith("https://s3.example.com/")
+
+        batch_res = client.post(
+            "/api/v1/jobs/batch/zip",
+            json={"job_ids": [jid], "export_format": "txt", "quality_preset": "high"},
+            headers=headers,
+        )
+        assert batch_res.status_code == 200, batch_res.text
+        assert batch_res.json()["direct_storage"] is True
+        assert batch_res.json()["download_url"].startswith("https://s3.example.com/")
+        assert mock_presign_dl.call_count >= 3

@@ -96,19 +96,23 @@ export async function uploadFileInChunks(
   let sessionId = callbacks.resumeSessionId;
   let totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
   let receivedSet = new Set<number>();
+  let uploadMode: "proxy" | "direct_s3" = "proxy";
 
   if (sessionId) {
     const statusRes = await apiFetch<{
       session_id: string;
       total_chunks: number;
       received_chunks: number[];
+      upload_mode?: "proxy" | "direct_s3";
     }>(`/uploads/${sessionId}`);
     totalChunks = statusRes.total_chunks;
     receivedSet = new Set(statusRes.received_chunks);
+    uploadMode = statusRes.upload_mode || "proxy";
   } else {
     const initRes = await apiFetch<{
       session_id: string;
       total_chunks: number;
+      upload_mode?: "proxy" | "direct_s3";
     }>("/uploads/init", {
       method: "POST",
       body: JSON.stringify({
@@ -119,6 +123,7 @@ export async function uploadFileInChunks(
     });
     sessionId = initRes.session_id;
     totalChunks = initRes.total_chunks;
+    uploadMode = initRes.upload_mode || "proxy";
     callbacks.onSessionCreated?.(sessionId);
   }
 
@@ -140,17 +145,41 @@ export async function uploadFileInChunks(
     const start = idx * CHUNK_SIZE_BYTES;
     const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
     const slice = file.slice(start, end);
-    const formData = new FormData();
-    formData.append("chunk", slice, `part_${idx}`);
 
-    const res = await fetch(`${API_BASE}/uploads/${sessionId}/chunk/${idx}`, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.detail || `Chunk ${idx} upload failed`);
+    if (uploadMode === "direct_s3") {
+      const partUrlRes = await apiFetch<{ upload_url: string; part_number: number }>(
+        `/uploads/${sessionId}/part-url/${idx}`
+      );
+      const s3Res = await fetch(partUrlRes.upload_url, {
+        method: "PUT",
+        body: slice,
+      });
+      if (!s3Res.ok) {
+        throw new Error(`Direct storage upload failed for chunk ${idx} (${s3Res.status})`);
+      }
+      const etag = s3Res.headers.get("ETag") || s3Res.headers.get("etag") || "";
+      if (!etag) {
+        throw new Error(
+          `Direct storage response missing ETag header for chunk ${idx}; verify S3 CORS ExposeHeaders includes ETag`
+        );
+      }
+      await apiFetch(`/uploads/${sessionId}/parts/${idx}`, {
+        method: "POST",
+        body: JSON.stringify({ etag }),
+      });
+    } else {
+      const formData = new FormData();
+      formData.append("chunk", slice, `part_${idx}`);
+
+      const res = await fetch(`${API_BASE}/uploads/${sessionId}/chunk/${idx}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.detail || `Chunk ${idx} upload failed`);
+      }
     }
 
     callbacks.onProgress(end, file.size, Math.round((end / file.size) * 100));
@@ -304,16 +333,22 @@ export async function createExport(
   });
 }
 
+function resolveDownloadUrl(downloadUrl: string): string {
+  if (/^https?:\/\//i.test(downloadUrl)) {
+    return downloadUrl;
+  }
+  const baseOrigin = API_BASE.replace(/\/api\/v1$/, "");
+  return `${baseOrigin}${downloadUrl}`;
+}
+
 export async function getExportDownloadUrl(jobId: string, artifactId: string): Promise<string> {
   const res = await apiFetch<{ download_url: string }>(`/jobs/${jobId}/exports/${artifactId}/link`);
-  const baseOrigin = API_BASE.replace(/\/api\/v1$/, "");
-  return `${baseOrigin}${res.download_url}`;
+  return resolveDownloadUrl(res.download_url);
 }
 
 export async function getOriginalDownloadUrl(jobId: string): Promise<string> {
   const res = await apiFetch<{ download_url: string }>(`/jobs/${jobId}/original/link`);
-  const baseOrigin = API_BASE.replace(/\/api\/v1$/, "");
-  return `${baseOrigin}${res.download_url}`;
+  return resolveDownloadUrl(res.download_url);
 }
 
 export async function createBatchZip(jobIds: string[], exportFormat = "txt", qualityPreset = "high") {
@@ -321,8 +356,7 @@ export async function createBatchZip(jobIds: string[], exportFormat = "txt", qua
     method: "POST",
     body: JSON.stringify({ job_ids: jobIds, export_format: exportFormat, quality_preset: qualityPreset }),
   });
-  const baseOrigin = API_BASE.replace(/\/api\/v1$/, "");
-  return { ...res, full_url: `${baseOrigin}${res.download_url}` };
+  return { ...res, full_url: resolveDownloadUrl(res.download_url) };
 }
 
 export async function getStudyProviderStatus(): Promise<{

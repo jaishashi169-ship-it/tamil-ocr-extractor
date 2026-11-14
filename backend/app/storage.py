@@ -19,6 +19,7 @@ class PrivateStorage:
         self.local_root = Path(settings.LOCAL_STORAGE_ROOT).resolve()
         self.local_root.mkdir(parents=True, exist_ok=True)
         self._s3 = None
+        self._s3_public = None
         if self.backend == "s3":
             self._s3 = boto3.client(
                 "s3",
@@ -28,10 +29,105 @@ class PrivateStorage:
                 region_name=settings.S3_REGION,
                 config=Config(signature_version="s3v4"),
             )
+            pub_endpoint = settings.S3_PUBLIC_ENDPOINT_URL or settings.S3_ENDPOINT_URL
+            self._s3_public = (
+                self._s3
+                if pub_endpoint == settings.S3_ENDPOINT_URL
+                else boto3.client(
+                    "s3",
+                    endpoint_url=pub_endpoint,
+                    aws_access_key_id=settings.S3_ACCESS_KEY,
+                    aws_secret_access_key=settings.S3_SECRET_KEY,
+                    region_name=settings.S3_REGION,
+                    config=Config(signature_version="s3v4"),
+                )
+            )
             try:
                 self._s3.head_bucket(Bucket=settings.S3_BUCKET_NAME)
             except Exception:
                 self._s3.create_bucket(Bucket=settings.S3_BUCKET_NAME)
+
+    def is_s3(self) -> bool:
+        return self.backend == "s3" and self._s3 is not None
+
+    def create_multipart_upload(self, key: str) -> str:
+        assert self._s3 is not None
+        res = self._s3.create_multipart_upload(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        return res["UploadId"]
+
+    def presign_upload_part(self, key: str, upload_id: str, part_number: int, expires_in: int = 900) -> str:
+        client = self._s3_public or self._s3
+        assert client is not None
+        return client.generate_presigned_url(
+            "upload_part",
+            Params={
+                "Bucket": settings.S3_BUCKET_NAME,
+                "Key": key,
+                "UploadId": upload_id,
+                "PartNumber": part_number,
+            },
+            ExpiresIn=expires_in,
+        )
+
+    def complete_multipart_upload(self, key: str, upload_id: str, parts: list[dict]) -> None:
+        assert self._s3 is not None
+        sorted_parts = sorted(parts, key=lambda p: int(p["PartNumber"]))
+        self._s3.complete_multipart_upload(
+            Bucket=settings.S3_BUCKET_NAME,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": sorted_parts},
+        )
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> None:
+        if not self._s3 or not upload_id:
+            return
+        try:
+            self._s3.abort_multipart_upload(
+                Bucket=settings.S3_BUCKET_NAME,
+                Key=key,
+                UploadId=upload_id,
+            )
+        except Exception:
+            pass
+
+    def head_object_size(self, key: str) -> int:
+        assert self._s3 is not None
+        res = self._s3.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        return int(res["ContentLength"])
+
+    def read_head_bytes(self, key: str, num_bytes: int = 8192) -> bytes:
+        assert self._s3 is not None
+        res = self._s3.get_object(
+            Bucket=settings.S3_BUCKET_NAME,
+            Key=key,
+            Range=f"bytes=0-{max(0, num_bytes - 1)}",
+        )
+        return res["Body"].read()
+
+    def compute_sha256_streaming(self, key: str) -> tuple[int, str]:
+        assert self._s3 is not None
+        res = self._s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        sha256 = hashlib.sha256()
+        total = 0
+        for chunk in res["Body"].iter_chunks(chunk_size=1024 * 1024):
+            if chunk:
+                sha256.update(chunk)
+                total += len(chunk)
+        return total, sha256.hexdigest()
+
+    def presign_download_url(self, key: str, filename: str, expires_in: int = 900) -> str:
+        client = self._s3_public or self._s3
+        assert client is not None
+        return client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": settings.S3_BUCKET_NAME,
+                "Key": key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=expires_in,
+        )
 
     def local_path_for(self, key: str) -> Path:
         path = safe_join(self.local_root, *key.split("/"))
@@ -152,6 +248,15 @@ class PrivateStorage:
                 shutil.rmtree(target_dir, ignore_errors=True)
         except Exception:
             pass
+        if self.backend == "s3" and self._s3 is not None:
+            try:
+                paginator = self._s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix):
+                    objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                    if objs:
+                        self._s3.delete_objects(Bucket=settings.S3_BUCKET_NAME, Delete={"Objects": objs})
+            except Exception:
+                pass
 
     def get_total_usage_bytes(self) -> int:
         total = 0

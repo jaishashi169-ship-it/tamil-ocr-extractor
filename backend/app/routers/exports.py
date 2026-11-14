@@ -166,8 +166,13 @@ def get_export_download_link(
     )
     if not art:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export artifact not found")
+    if storage.is_s3():
+        url = storage.presign_download_url(
+            art.storage_key, Path(art.storage_key).name, settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS
+        )
+        return {"download_url": url, "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS, "direct_storage": True}
     token = create_download_token(current_user.id, "export", art.id)
-    return {"download_url": f"/api/v1/downloads/{token}", "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS}
+    return {"download_url": f"/api/v1/downloads/{token}", "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS, "direct_storage": False}
 
 
 @router.get("/jobs/{job_id}/original/link")
@@ -179,8 +184,13 @@ def get_original_download_link(
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == current_user.id).first()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if storage.is_s3():
+        url = storage.presign_download_url(
+            job.original_storage_key, job.original_filename, settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS
+        )
+        return {"download_url": url, "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS, "direct_storage": True}
     token = create_download_token(current_user.id, "original", job.id)
-    return {"download_url": f"/api/v1/downloads/{token}", "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS}
+    return {"download_url": f"/api/v1/downloads/{token}", "expires_in_seconds": settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS, "direct_storage": False}
 
 
 @router.post("/jobs/batch/zip")
@@ -226,11 +236,16 @@ def create_batch_zip(
     db.add(art)
     db.commit()
     db.refresh(art)
-    token = create_download_token(current_user.id, "export", art.id)
+    if storage.is_s3():
+        dl_url = storage.presign_download_url(key, Path(key).name, settings.DOWNLOAD_TOKEN_EXPIRE_SECONDS)
+    else:
+        token = create_download_token(current_user.id, "export", art.id)
+        dl_url = f"/api/v1/downloads/{token}"
     return {
         "artifact_id": art.id,
         "file_size_bytes": len(zip_bytes),
-        "download_url": f"/api/v1/downloads/{token}",
+        "download_url": dl_url,
+        "direct_storage": storage.is_s3(),
     }
 
 

@@ -52,6 +52,8 @@ class UploadSession(Base):
     detected_mime = Column(String(128), nullable=True)
     format_type = Column(String(32), nullable=True)
     storage_key = Column(String(512), nullable=True)
+    s3_upload_id = Column(String(255), nullable=True)
+    s3_parts_json = Column(JSON, nullable=False, default=list)
     status = Column(String(32), nullable=False, default="uploading")  # uploading | paused | completed | aborted
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     STORAGE_BACKEND: str = "local"  # "local" or "s3"
     LOCAL_STORAGE_ROOT: str = "./private_storage"
     S3_ENDPOINT_URL: str = "http://localhost:9000"
+    S3_PUBLIC_ENDPOINT_URL: str = ""
     S3_BUCKET_NAME: str = "tamil-doc-studio-private"
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"

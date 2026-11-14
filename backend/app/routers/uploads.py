@@ -31,8 +31,14 @@ class UploadSessionResponse(BaseModel):
     total_chunks: int
     received_chunks: List[int]
     status: str
+    upload_mode: str = "proxy"
     format_type: str | None = None
     sha256_hash: str | None = None
+
+
+class RegisterS3PartRequest(BaseModel):
+    etag: str = Field(min_length=1, max_length=256)
+    size_bytes: int = Field(ge=0, default=0)
 
 
 @router.post("/init", response_model=UploadSessionResponse, status_code=status.HTTP_201_CREATED)
@@ -70,9 +76,19 @@ def init_upload(
         chunk_size_bytes=payload.chunk_size_bytes,
         total_chunks=total_chunks,
         received_chunks=[],
+        s3_parts_json=[],
         status="uploading",
     )
     db.add(session)
+    db.flush()
+
+    upload_mode = "proxy"
+    if storage.is_s3():
+        dest_key = f"uploads/{current_user.id}/{session.id}/{safe_name}"
+        session.storage_key = dest_key
+        session.s3_upload_id = storage.create_multipart_upload(dest_key)
+        upload_mode = "direct_s3"
+
     db.commit()
     db.refresh(session)
 
@@ -84,6 +100,74 @@ def init_upload(
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks,
         status=session.status,
+        upload_mode=upload_mode,
+    )
+
+
+@router.get("/{session_id}/part-url/{chunk_index}")
+def get_direct_part_upload_url(
+    session_id: str,
+    chunk_index: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(UploadSession)
+        .filter(UploadSession.id == session_id, UploadSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+    if session.status in {"completed", "aborted"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
+    if chunk_index < 0 or chunk_index >= session.total_chunks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
+    if not session.s3_upload_id or not session.storage_key or not storage.is_s3():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Direct S3 upload is not enabled for this session")
+
+    part_number = chunk_index + 1
+    url = storage.presign_upload_part(session.storage_key, session.s3_upload_id, part_number, expires_in=900)
+    return {"upload_url": url, "part_number": part_number, "expires_in_seconds": 900}
+
+
+@router.post("/{session_id}/parts/{chunk_index}", response_model=UploadSessionResponse)
+def register_direct_s3_part(
+    session_id: str,
+    chunk_index: int,
+    payload: RegisterS3PartRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(UploadSession)
+        .filter(UploadSession.id == session_id, UploadSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+    if session.status in {"completed", "aborted"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
+    if chunk_index < 0 or chunk_index >= session.total_chunks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
+
+    part_number = chunk_index + 1
+    parts = [p for p in (session.s3_parts_json or []) if int(p.get("PartNumber", -1)) != part_number]
+    parts.append({"PartNumber": part_number, "ETag": payload.etag})
+    session.s3_parts_json = parts
+    session.received_chunks = sorted(set(list(session.received_chunks or []) + [chunk_index]))
+    session.status = "uploading"
+    db.commit()
+    db.refresh(session)
+
+    return UploadSessionResponse(
+        session_id=session.id,
+        filename=session.filename,
+        expected_size_bytes=session.expected_size_bytes,
+        chunk_size_bytes=session.chunk_size_bytes,
+        total_chunks=session.total_chunks,
+        received_chunks=session.received_chunks,
+        status=session.status,
+        upload_mode="direct_s3",
     )
 
 
@@ -155,21 +239,27 @@ def get_upload_status(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+    received_bytes = (
+        session.expected_size_bytes
+        if session.status == "completed"
+        else (
+            min(session.expected_size_bytes, len(session.received_chunks or []) * session.chunk_size_bytes)
+            if session.s3_upload_id
+            else storage.get_session_chunks_total_bytes(session.id)
+        )
+    )
     return UploadSessionResponse(
         session_id=session.id,
         filename=session.filename,
         expected_size_bytes=session.expected_size_bytes,
-        received_bytes=(
-            session.expected_size_bytes
-            if session.status == "completed"
-            else storage.get_session_chunks_total_bytes(session.id)
-        ),
+        received_bytes=received_bytes,
         chunk_size_bytes=session.chunk_size_bytes,
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks or [],
         status=session.status,
         format_type=session.format_type,
         sha256_hash=session.sha256_hash,
+        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
     )
 
 
@@ -198,6 +288,7 @@ def pause_upload(
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks or [],
         status=session.status,
+        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
     )
 
 
@@ -223,28 +314,49 @@ def complete_upload(
             detail=f"Upload incomplete. Missing {len(missing)} chunk(s), starting at {missing[0]}.",
         )
 
-    dest_key = f"uploads/{current_user.id}/{session.id}/{session.filename}"
-    actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
+    if session.s3_upload_id and session.storage_key and storage.is_s3():
+        dest_key = session.storage_key
+        storage.complete_multipart_upload(dest_key, session.s3_upload_id, session.s3_parts_json or [])
+        actual_bytes = storage.head_object_size(dest_key)
+        if actual_bytes > settings.MAX_UPLOAD_BYTES:
+            storage.delete_key(dest_key)
+            session.status = "aborted"
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Assembled file ({actual_bytes:,} bytes) exceeds 500 MB limit ({settings.MAX_UPLOAD_BYTES:,} bytes).",
+            )
+        header = storage.read_head_bytes(dest_key, 4096)
+        fmt, err = detect_format_by_signature(header, session.filename)
+        if err or not fmt:
+            storage.delete_key(dest_key)
+            session.status = "aborted"
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=err or "Unsupported file format")
+        _, sha256_hex = storage.compute_sha256_streaming(dest_key)
+    else:
+        dest_key = f"uploads/{current_user.id}/{session.id}/{session.filename}"
+        actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
 
-    if actual_bytes > settings.MAX_UPLOAD_BYTES:
-        storage.delete_key(dest_key)
-        session.status = "aborted"
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Assembled file ({actual_bytes:,} bytes) exceeds 500 MB limit ({settings.MAX_UPLOAD_BYTES:,} bytes).",
-        )
+        if actual_bytes > settings.MAX_UPLOAD_BYTES:
+            storage.delete_key(dest_key)
+            session.status = "aborted"
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Assembled file ({actual_bytes:,} bytes) exceeds 500 MB limit ({settings.MAX_UPLOAD_BYTES:,} bytes).",
+            )
 
-    # Validate magic-byte content signature as well as extension
-    assembled_path = storage.get_local_file(dest_key)
-    with open(assembled_path, "rb") as f:
-        header = f.read(4096)
-    fmt, err = detect_format_by_signature(header, session.filename)
-    if err or not fmt:
-        storage.delete_key(dest_key)
-        session.status = "aborted"
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=err or "Unsupported file format")
+        # Validate magic-byte content signature as well as extension
+        assembled_path = storage.get_local_file(dest_key)
+        with open(assembled_path, "rb") as f:
+            header = f.read(4096)
+        fmt, err = detect_format_by_signature(header, session.filename)
+        if err or not fmt:
+            storage.delete_key(dest_key)
+            session.status = "aborted"
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=err or "Unsupported file format")
 
     session.storage_key = dest_key
     session.sha256_hash = sha256_hex
@@ -254,21 +366,27 @@ def complete_upload(
     db.commit()
     db.refresh(session)
 
+    received_bytes = (
+        session.expected_size_bytes
+        if session.status == "completed"
+        else (
+            min(session.expected_size_bytes, len(session.received_chunks or []) * session.chunk_size_bytes)
+            if session.s3_upload_id
+            else storage.get_session_chunks_total_bytes(session.id)
+        )
+    )
     return UploadSessionResponse(
         session_id=session.id,
         filename=session.filename,
         expected_size_bytes=session.expected_size_bytes,
-        received_bytes=(
-            session.expected_size_bytes
-            if session.status == "completed"
-            else storage.get_session_chunks_total_bytes(session.id)
-        ),
+        received_bytes=received_bytes,
         chunk_size_bytes=session.chunk_size_bytes,
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks or [],
         status=session.status,
         format_type=session.format_type,
         sha256_hash=session.sha256_hash,
+        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
     )
 
 
@@ -286,6 +404,8 @@ def abort_upload(
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
     storage.abort_chunks(session.id)
+    if session.s3_upload_id and session.storage_key and session.status != "completed":
+        storage.abort_multipart_upload(session.storage_key, session.s3_upload_id)
     if session.storage_key:
         storage.delete_key(session.storage_key)
     session.status = "aborted"

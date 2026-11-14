@@ -5,9 +5,9 @@
 ## Audit Metadata
 - **Date:** 2026-11-14
 - **Workspace:** `e:\AI WEB Application Development lists\Tamil OCR Extractor`
-- **Source Revision:** Code baseline `0144358c12b574efd6545028723179e749e53452`; final release/audit commit tagged `audit-baseline-v1` on `master` (see `git rev-parse HEAD`)
+- **Source Revision:** See `git rev-parse HEAD` on `main` (includes `vercel.json` multi-service routing and `0003_s3_direct_upload` direct-to-S3 multipart upload & presigned download support)
 - **Audit Environment:** Windows host; Python `3.12.10`, FastAPI `0.115.6`, SQLAlchemy `2.0.37`, Celery `5.4.0`, Kombu `5.7.0`, PyMuPDF `1.25.2`, Next.js `15.5.29`, React `19.0.0`, TypeScript `5.7.3`
-- **Host External Dependencies Absent:** `docker` / `docker compose`, `tesseract` (`tam` + `eng`), `soffice` (LibreOffice), `redis-server`, `GEMINI_API_KEY` / `OPENAI_API_KEY`
+- **Host External Dependencies Absent:** `docker` / `docker compose`, `vercel` CLI, `tesseract` (`tam` + `eng`), `soffice` (LibreOffice), `redis-server`, `GEMINI_API_KEY` / `OPENAI_API_KEY`
 
 ---
 
@@ -15,7 +15,7 @@
 - **[PASS]** Dependency versions recorded (`python 3.12.10`, `celery 5.4.0`, `kombu 5.7.0`, `fastapi 0.115.6`, `sqlalchemy 2.0.37`, `pymupdf 1.25.2`, `next 15.5.29`).
 - **[PASS]** `.env.example` documents all required settings (`APP_ENV`, `SECRET_KEY`, `DATABASE_URL`, `SYNC_DATABASE_URL`, `REDIS_*`, `ALLOW_BACKGROUND_TASK_FALLBACK`, `JOB_LEASE_SECONDS`, `STORAGE_*`, `GEMINI_API_KEY`, `OPENAI_API_KEY`) without secrets.
 - **[PASS]** Production rejects insecure placeholder `SECRET_KEY` and short secrets (`<32` chars) via `Settings.validate_production_safety()` (`test_production_rejects_placeholder_secret`).
-- **[PASS]** Fresh-database Alembic migrations verified: `alembic upgrade head` on a brand-new SQLite DB cleanly ran `0001_initial -> 0002_worker_ownership (head)`.
+- **[PASS]** Fresh-database & incremental Alembic migrations verified: `alembic upgrade head` ran cleanly through `0003_s3_direct_upload (head)`.
 - **[PASS (Static Inspection)]** `backend/Dockerfile` installs `tesseract-ocr`, `tesseract-ocr-tam`, `tesseract-ocr-eng`, `libreoffice-writer`, `poppler-utils`, `fonts-noto-core`, and `fonts-noto-extra` under non-root `appuser`. `frontend/Dockerfile` uses `npm ci` and accepts build-time `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_MAX_UPLOAD_BYTES` args, wired from `docker-compose.yml` (`build.args`) with healthchecks on `postgres`, `redis`, `minio`, `backend`, `worker`, and `frontend`.
 - **[BLOCKED]** Clean Docker image builds and live container execution on a Docker host (`docker` not installed on this Windows host).
 
@@ -30,6 +30,8 @@
 - **[PASS]** Exact `500,000,000`-byte init accepted and `500,000,001`-byte init rejected with `413` (`test_500mb_limit_enforcement`).
 - **[PASS]** Streamed chunked upload exceeding `MAX_UPLOAD_BYTES` rejected with `413` without buffering entire 500 MB in memory.
 - **[PASS]** Pause, status inspection, resume, idempotent chunk retries, conflicting chunk `409`, and final SHA-256 verification passed (`test_verification_suite.py`, `test_hardening_and_e2e.py`).
+- **[PASS (Mocked S3)]** Direct-to-S3 multipart upload (`upload_mode="direct_s3"`, presigned part URLs, ETag registration, `413` >500 MB & `415` bad signature enforcement, streaming SHA-256, abort on `DELETE`) and presigned `https://` downloads (`direct_storage=True`) verified (`test_direct_s3_multipart_upload_and_presigned_downloads`).
+- **[BLOCKED]** Live Vercel preview deployment (`/health` and `/api/v1` route verification, `vercel` CLI schema check) and live S3/MinIO CORS browser upload test.
 
 ## 4. Queue and Worker Reliability
 - **[PASS (Mocked Broker)]** Production (`APP_ENV=production`) and `ALLOW_BACKGROUND_TASK_FALLBACK=false` reject Redis unavailability and post-ping publish failures with HTTP `503 QUEUE_UNAVAILABLE` (`Retry-After: 5`) and mark jobs `status="failed"` (never permanently `queued`).

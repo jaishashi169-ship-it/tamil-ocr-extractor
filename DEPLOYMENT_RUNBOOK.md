@@ -14,8 +14,27 @@
    - `APP_ENV=production`
    - `SECRET_KEY=<64-char random hex string>` (startup fails if left at the dev placeholder or `<32` chars)
    - `ALLOW_BACKGROUND_TASK_FALLBACK=false`
-   - `NEXT_PUBLIC_API_URL=https://your-domain.example/api/v1`
+   - `NEXT_PUBLIC_API_URL=https://your-domain.example/api/v1` (or omit when deploying multi-service on Vercel with same-origin `/api/(.*)` routing)
+   - `STORAGE_BACKEND=s3` with `S3_ENDPOINT_URL`, `S3_PUBLIC_ENDPOINT_URL` (browser-reachable presigned URL host), `S3_BUCKET_NAME`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_REGION` for direct-to-storage 500 MB uploads/downloads (bypasses Vercel Functions' 4.5 MB request/response limit)
    - `GEMINI_API_KEY` / `OPENAI_API_KEY` (if enabling Study Studio)
+
+### S3 / MinIO Bucket CORS (Required for Direct Browser Uploads)
+When `STORAGE_BACKEND=s3`, configure bucket CORS to allow `PUT` and `GET` from your frontend origin and expose `ETag` so the browser can register multipart part ETags:
+```json
+[
+  {
+    "AllowedOrigins": ["https://your-frontend.example"],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+### Vercel Multi-Service vs. Docker Worker Architecture
+- Root `vercel.json` defines `frontend` (Next.js) and `backend` (FastAPI `app/main.py`) with `/api/(.*)` and `/health` routed to `backend` and `/(.*)` routed to `frontend`.
+- Heavy OCR (`tesseract-ocr` `tam`+`eng`, `soffice`, Celery workers, PostgreSQL, Redis) still requires the containerized Docker worker stack (`docker-compose.yml`). Set `NEXT_PUBLIC_API_URL` if routing browser API calls to an external container backend instead of Vercel's `/api` service.
 
 ## 3. Build, Migrate & Start
 ```bash
@@ -25,7 +44,7 @@ docker compose ps
 The `backend` container runs `alembic upgrade head` before starting `uvicorn`. Verify the migration head:
 ```bash
 docker compose exec backend alembic current
-# Expected: 0002_worker_ownership (head)
+# Expected: 0003_s3_direct_upload (head)
 ```
 Verify OCR languages inside the isolated `worker` container:
 ```bash
