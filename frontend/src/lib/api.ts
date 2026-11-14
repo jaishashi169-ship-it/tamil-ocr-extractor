@@ -9,11 +9,26 @@ import {
   StudyProjectRecord,
 } from "./types";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ||
-  (typeof window !== "undefined" && window.location.hostname !== "localhost"
-    ? "/api/v1"
-    : "http://localhost:8000/api/v1");
+export function resolveApiBase(
+  envUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL,
+  hostname: string | undefined = typeof window !== "undefined" ? window.location.hostname : "localhost"
+): string {
+  const trimmed = (envUrl || "").trim().replace(/\/+$/, "");
+  if (trimmed) {
+    return trimmed.endsWith("/api/v1") ? trimmed : `${trimmed}/api/v1`;
+  }
+  if (!hostname || hostname === "localhost" || hostname === "127.0.0.1") {
+    return "http://localhost:8000/api/v1";
+  }
+  throw new Error(
+    "NEXT_PUBLIC_API_URL is not configured. Set NEXT_PUBLIC_API_URL to your HTTPS backend API base (including /api/v1) before building the frontend."
+  );
+}
+
+function getApiBase(): string {
+  return resolveApiBase();
+}
+
 const TOKEN_STORAGE_KEY = "teds_access_token";
 
 export function getStoredToken(): string | null {
@@ -31,7 +46,7 @@ export async function ensureAuthToken(): Promise<string> {
   const existing = getStoredToken();
   if (existing) return existing;
 
-  const res = await fetch(`${API_BASE}/auth/guest`, { method: "POST" });
+  const res = await fetch(`${getApiBase()}/auth/guest`, { method: "POST" });
   if (!res.ok) {
     throw new Error("Unable to initialize studio session.");
   }
@@ -48,12 +63,13 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const apiBase = getApiBase();
+  const res = await fetch(`${apiBase}${path}`, { ...init, headers });
   if (res.status === 401 && typeof window !== "undefined") {
     localStorage.removeItem(TOKEN_STORAGE_KEY);
     const freshToken = await ensureAuthToken();
     headers.set("Authorization", `Bearer ${freshToken}`);
-    const retry = await fetch(`${API_BASE}${path}`, { ...init, headers });
+    const retry = await fetch(`${apiBase}${path}`, { ...init, headers });
     if (!retry.ok) {
       const errBody = await retry.json().catch(() => ({}));
       throw new Error(errBody.detail || `Request failed (${retry.status})`);
@@ -176,7 +192,7 @@ export async function uploadFileInChunks(
       const formData = new FormData();
       formData.append("chunk", slice, `part_${idx}`);
 
-      const res = await fetch(`${API_BASE}/uploads/${sessionId}/chunk/${idx}`, {
+      const res = await fetch(`${getApiBase()}/uploads/${sessionId}/chunk/${idx}`, {
         method: "PUT",
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
@@ -267,7 +283,7 @@ export async function getJobPages(jobId: string): Promise<{ job_id: string; tota
 
 export async function fetchPageImageBlobUrl(jobId: string, pageNumber: number, kind: "preview" | "thumbnail" = "preview"): Promise<string> {
   const token = await ensureAuthToken();
-  const res = await fetch(`${API_BASE}/jobs/${jobId}/pages/${pageNumber}/image?kind=${kind}`, {
+  const res = await fetch(`${getApiBase()}/jobs/${jobId}/pages/${pageNumber}/image?kind=${kind}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Preview image unavailable");
@@ -375,8 +391,9 @@ function resolveDownloadUrl(downloadUrl: string): string {
   if (/^https?:\/\//i.test(downloadUrl)) {
     return downloadUrl;
   }
-  const baseOrigin = API_BASE.replace(/\/api\/v1$/, "");
-  return `${baseOrigin}${downloadUrl}`;
+  const baseOrigin = getApiBase().replace(/\/api\/v1$/, "");
+  const normalizedPath = downloadUrl.startsWith("/") ? downloadUrl : `/${downloadUrl}`;
+  return `${baseOrigin}${normalizedPath}`;
 }
 
 export async function getExportDownloadUrl(jobId: string, artifactId: string): Promise<string> {
@@ -449,7 +466,7 @@ export async function exportStudyProjectBlob(
   targetTotalMarks?: number
 ): Promise<Blob> {
   const token = await ensureAuthToken();
-  const res = await fetch(`${API_BASE}/study/projects/${projectId}/export`, {
+  const res = await fetch(`${getApiBase()}/study/projects/${projectId}/export`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ export_format: exportFormat, layout, target_total_marks: targetTotalMarks }),

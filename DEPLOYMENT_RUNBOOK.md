@@ -13,9 +13,10 @@
 2. Set production values in `.env`:
    - `APP_ENV=production`
    - `SECRET_KEY=<64-char random hex string>` (startup fails if left at the dev placeholder or `<32` chars)
+   - `CORS_ORIGINS=https://your-frontend.vercel.app` (exact frontend origin(s), comma-separated; wildcard `*` is rejected in `APP_ENV=production`)
    - `ALLOW_BACKGROUND_TASK_FALLBACK=false`
-   - `NEXT_PUBLIC_API_URL=https://your-domain.example/api/v1` (or omit when deploying multi-service on Vercel with same-origin `/api/(.*)` routing)
-   - `STORAGE_BACKEND=s3` with `S3_ENDPOINT_URL`, `S3_PUBLIC_ENDPOINT_URL` (browser-reachable presigned URL host), `S3_BUCKET_NAME`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_REGION` for direct-to-storage 500 MB uploads/downloads (bypasses Vercel Functions' 4.5 MB request/response limit)
+   - `NEXT_PUBLIC_API_URL=https://api.your-domain.example/api/v1` (required for Vercel frontend builds; `api.ts` normalizes trailing slashes/`/api/v1` and fails clearly in production if unset)
+   - `STORAGE_BACKEND=s3` with `S3_ENDPOINT_URL`, `S3_PUBLIC_ENDPOINT_URL` (browser-reachable presigned URL host), `S3_BUCKET_NAME`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_REGION` for direct-to-storage 500 MB uploads/downloads (8 MiB multipart parts via `S3_MULTIPART_PART_BYTES=8388608`)
    - `GEMINI_API_KEY` / `OPENAI_API_KEY` (if enabling Study Studio)
 
 ### S3 / MinIO Bucket CORS (Required for Direct Browser Uploads)
@@ -23,7 +24,7 @@ When `STORAGE_BACKEND=s3`, configure bucket CORS to allow `PUT` and `GET` from y
 ```json
 [
   {
-    "AllowedOrigins": ["https://your-frontend.example"],
+    "AllowedOrigins": ["https://your-frontend.vercel.app"],
     "AllowedMethods": ["GET", "PUT", "HEAD"],
     "AllowedHeaders": ["*"],
     "ExposeHeaders": ["ETag"],
@@ -32,9 +33,9 @@ When `STORAGE_BACKEND=s3`, configure bucket CORS to allow `PUT` and `GET` from y
 ]
 ```
 
-### Vercel Multi-Service vs. Docker Worker Architecture
-- Root `vercel.json` defines `frontend` (Next.js) and `backend` (FastAPI `app/main.py`) with `/api/(.*)` and `/health` routed to `backend` and `/(.*)` routed to `frontend`.
-- Heavy OCR (`tesseract-ocr` `tam`+`eng`, `soffice`, Celery workers, PostgreSQL, Redis) still requires the containerized Docker worker stack (`docker-compose.yml`). Set `NEXT_PUBLIC_API_URL` if routing browser API calls to an external container backend instead of Vercel's `/api` service.
+### Vercel Frontend + Docker Backend/Worker Architecture
+- Root `vercel.json` is configured for a **frontend-only Next.js deployment** (`frontend/`), so Vercel does **not** bundle the Python backend (which exceeds Vercel's 500 MB Lambda limit due to OCR/PDF/office dependencies). If you set Root Directory to `frontend` in Vercel Project Settings, keep `NEXT_PUBLIC_API_URL` configured in Vercel's build environment variables.
+- Deploy FastAPI (`backend`), Celery (`worker`), PostgreSQL (`postgres`), Redis (`redis`), and private object storage (`minio` or external S3) on a Docker host using `docker-compose.yml` (`docker compose up --build -d backend worker`). Do **not** publish PostgreSQL (`5432`) or Redis (`6379`) ports publicly; `docker-compose.yml` isolates them on `internal_net`.
 
 ## 3. Build, Migrate & Start
 ```bash

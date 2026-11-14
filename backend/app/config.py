@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "dev-insecure-secret-change-in-production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 120
     DOWNLOAD_TOKEN_EXPIRE_SECONDS: int = 900
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3019,http://127.0.0.1:3019"
 
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./tamil_doc_studio.db"
@@ -56,8 +57,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     STUDY_MAX_COST_USD: float = 2.00
 
+    def parsed_cors_origins(self) -> list[str]:
+        return [origin.strip().rstrip("/") for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
     def validate_production_safety(self) -> None:
-        """Reject insecure placeholder secrets when running in production."""
+        """Reject insecure placeholder secrets and wildcard CORS when running in production."""
         if self.APP_ENV == "production":
             if (
                 not self.SECRET_KEY
@@ -66,6 +70,11 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "APP_ENV=production requires a strong SECRET_KEY (>= 32 characters, not the dev placeholder)."
+                )
+            origins = self.parsed_cors_origins()
+            if not origins or "*" in origins:
+                raise ValueError(
+                    "APP_ENV=production requires explicit CORS_ORIGINS (wildcard '*' is not allowed)."
                 )
 
 

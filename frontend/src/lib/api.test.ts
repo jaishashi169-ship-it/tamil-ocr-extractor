@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { formatBytes, uploadFileInChunks } from "./api";
+import { formatBytes, resolveApiBase, uploadFileInChunks } from "./api";
 import { MAX_UPLOAD_BYTES } from "./types";
 
 const noopCallbacks = {
@@ -29,6 +29,13 @@ describe("Frontend API & chunked upload behavior", () => {
   it("formats byte sizes consistently with decimal MB", () => {
     expect(formatBytes(0)).toBe("0 B");
     expect(formatBytes(500_000_000)).toBe("500.0 MB");
+  });
+
+  it("normalizes NEXT_PUBLIC_API_URL without duplicating /api/v1 and fails clearly in production when missing", () => {
+    expect(resolveApiBase("https://api.example.com", "app.vercel.app")).toBe("https://api.example.com/api/v1");
+    expect(resolveApiBase("https://api.example.com/api/v1/", "app.vercel.app")).toBe("https://api.example.com/api/v1");
+    expect(resolveApiBase(undefined, "localhost")).toBe("http://localhost:8000/api/v1");
+    expect(() => resolveApiBase(undefined, "app.vercel.app")).toThrow("NEXT_PUBLIC_API_URL is not configured");
   });
 
   it("rejects files exceeding 500,000,000 bytes before initializing upload", async () => {

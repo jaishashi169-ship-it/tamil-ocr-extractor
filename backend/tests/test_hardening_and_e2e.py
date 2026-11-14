@@ -248,8 +248,15 @@ def test_production_rejects_placeholder_secret():
     with pytest.raises(ValueError, match="SECRET_KEY"):
         Settings(APP_ENV="production", SECRET_KEY="too-short").validate_production_safety()
 
-    # Strong 32+ char secret succeeds
-    Settings(APP_ENV="production", SECRET_KEY="A" * 40).validate_production_safety()
+    with pytest.raises(ValueError, match="CORS_ORIGINS"):
+        Settings(APP_ENV="production", SECRET_KEY="A" * 40, CORS_ORIGINS="*").validate_production_safety()
+
+    # Strong 32+ char secret + explicit CORS origin succeeds
+    Settings(
+        APP_ENV="production",
+        SECRET_KEY="A" * 40,
+        CORS_ORIGINS="https://tamil-doc-studio.vercel.app",
+    ).validate_production_safety()
 
 
 # ---------------------------------------------------------------------------
