@@ -35,7 +35,7 @@ export function RecentJobs({ jobs, onOpenJob, onRetryJob, onDeleteJob }: RecentJ
                   </p>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
                     {formatBytes(job.file_size_bytes)} · {job.format_type.toUpperCase()} ·{" "}
-                    {job.created_at ? new Date(job.created_at).toLocaleDateString() : ""}
+                    {job.created_at ? new Date(job.created_at).toLocaleDateString("en-US") : ""}
                   </p>
                 </div>
 

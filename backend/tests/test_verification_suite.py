@@ -36,8 +36,10 @@ def _upload_bytes(headers, filename: str, raw: bytes, chunk_size: int = 5_242_88
         )
         assert r.status_code == 200, r.text
     comp = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
-    assert comp.status_code == 200, comp.text
-    assert comp.json()["sha256_hash"] == hashlib.sha256(raw).hexdigest()
+    assert comp.status_code in {200, 202}, comp.text
+    st_done = client.get(f"/api/v1/uploads/{sid}", headers=headers).json()
+    assert st_done["status"] == "completed"
+    assert st_done["sha256_hash"] == hashlib.sha256(raw).hexdigest()
     return sid
 
 
@@ -104,8 +106,10 @@ def test_chunked_upload_idempotency_conflict_and_resume():
         assert r.status_code == 200
 
     comp = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
-    assert comp.status_code == 200
-    assert comp.json()["sha256_hash"] == hashlib.sha256(data).hexdigest()
+    assert comp.status_code in {200, 202}
+    st_done = client.get(f"/api/v1/uploads/{sid}", headers=headers).json()
+    assert st_done["status"] == "completed"
+    assert st_done["sha256_hash"] == hashlib.sha256(data).hexdigest()
 
 
 def test_real_english_pdf_tamil_docx_corrupt_and_encrypted_pdf():
@@ -143,7 +147,7 @@ def test_real_english_pdf_tamil_docx_corrupt_and_encrypted_pdf():
         json={"export_format": "docx", "quality_preset": "high"},
         headers=headers,
     )
-    assert exp_docx.status_code == 201
+    assert exp_docx.status_code in {201, 202}
     link_docx = client.get(f"/api/v1/jobs/{job_docx['job_id']}/exports/{exp_docx.json()['artifact_id']}/link", headers=headers)
     dl_docx = client.get(link_docx.json()["download_url"])
     parsed_docx = DocxDocument(io.BytesIO(dl_docx.content))

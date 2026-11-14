@@ -30,7 +30,8 @@
 - **[PASS]** Exact `500,000,000`-byte init accepted and `500,000,001`-byte init rejected with `413` (`test_500mb_limit_enforcement`).
 - **[PASS]** Streamed chunked upload exceeding `MAX_UPLOAD_BYTES` rejected with `413` without buffering entire 500 MB in memory.
 - **[PASS]** Pause, status inspection, resume, idempotent chunk retries, conflicting chunk `409`, and final SHA-256 verification passed (`test_verification_suite.py`, `test_hardening_and_e2e.py`).
-- **[PASS (Mocked S3)]** Direct-to-S3 multipart upload (`upload_mode="direct_s3"`, presigned part URLs, ETag registration, `413` >500 MB & `415` bad signature enforcement, streaming SHA-256, abort on `DELETE`) and presigned `https://` downloads (`direct_storage=True`) verified (`test_direct_s3_multipart_upload_and_presigned_downloads`).
+- **[PASS (Mocked S3)]** Direct-to-S3 multipart upload (`upload_mode="direct_s3"`, `S3_MULTIPART_PART_BYTES=8388608` [8 MiB >= 5 MiB AWS S3 minimum], presigned part URLs, ETag registration, worker-side `202` finalization with `413` >500 MB & `415` bad signature rejection + streaming SHA-256, abort on `DELETE`) and presigned `https://` downloads (`direct_storage=True`) verified (`test_direct_s3_multipart_upload_and_presigned_downloads`).
+- **[PASS (Worker Offload)]** Upload finalization (`finalize_upload_task`), single exports (`generate_export_task`), and batch ZIPs (`generate_batch_zip_task`) return `202 Accepted` (`status="processing"`) and execute in Celery (or explicit dev `BackgroundTasks` fallback), keeping large-file hashing/exporting out of FastAPI request handlers.
 - **[BLOCKED]** Live Vercel preview deployment (`/health` and `/api/v1` route verification, `vercel` CLI schema check) and live S3/MinIO CORS browser upload test.
 
 ## 4. Queue and Worker Reliability
@@ -63,7 +64,8 @@
 
 ## 9. Frontend and Accessibility
 - **[PASS]** `npx tsc --noEmit` (0 errors), `npm test` (5/5 Vitest tests), and `npm run build` (Next.js `15.5.29` production build) passed.
-- **[BLOCKED]** Real-browser end-to-end Upload → Options → Review → Download walkthrough, mobile/keyboard/a11y audit, and console error check against running backend + frontend containers.
+- **[PASS (Local Headless Chrome)]** Verified `/`, `/study`, and `/admin` in headless Chrome (`verify_responsive.mjs`) across widths `320, 375, 768, 1024, 1440` px in English & Tamil: `0` horizontal overflow (`horizontalOverflow: false`, `tamilOverflow: false`), `0` overflowing header links (`headerHeight: 61`), keyboard `Tab` focus works, real upload -> extract -> Review pane switching (`375px` & `768px` tabs vs `1024px` split pane) succeeded, and `0` browser console/hydration errors (`consoleErrors: []`).
+- **[BLOCKED]** Live HTTPS production browser E2E walkthrough against deployed Vercel + Docker/Celery/S3 stack.
 
 ## 10. Deployment and Operations
 - **[PASS]** Live local `uvicorn` integration check (`scripts/verify_integration.py`) passed health, async job completion, SHA-256 original download, Unicode edit/save/reload, and `txt`/`md`/`docx`/`searchable_pdf` exports (`OCR` and `Live Study Studio` reported `BLOCKED` as expected).

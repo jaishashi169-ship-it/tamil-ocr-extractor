@@ -13,4 +13,4 @@
 | **Editable review, autosave & grammar review** | `backend/app/routers/pages.py`, `backend/app/services/study/grammar.py` | `test_optimistic_concurrency_and_grammar_review`, `verify_integration.py` | **PASS** |
 | **Original, converted & compressed downloads** | `backend/app/routers/exports.py`, `backend/app/services/exporters/` | `test_compression_presets_and_export_file_opening`, `verify_integration.py` | **PASS** |
 | **AI Study Guides & 1/2/3/5/10M Question Banks** | `backend/app/routers/study.py`, `backend/app/services/study/` | `test_study_studio_unconfigured_returns_503`, `test_study_studio_all_marks_lock_verification_and_exports` | **PASS** (503 guard & mocked AI); **BLOCKED** (live LLM key) |
-| **Responsive English/தமிழ் frontend** | `frontend/src/` | `npx tsc --noEmit`, `npm test` (5/5), `npm run build` | **PASS** (build/unit); **BLOCKED** (live browser E2E) |
+| **Responsive English/தமிழ் frontend** | `frontend/src/` | `npx tsc --noEmit`, `npm test` (5/5), `npm run build`, headless Chrome (`320..1440` px, `0` overflow/console errors) | **PASS** (local browser); **BLOCKED** (live HTTPS preview) |

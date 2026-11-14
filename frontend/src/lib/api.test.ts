@@ -63,7 +63,7 @@ describe("Frontend API & chunked upload behavior", () => {
       }
       if (url.endsWith("/complete")) {
         return new Response(
-          JSON.stringify({ session_id: "sess-1", format_type: "txt", sha256_hash: "abc123" }),
+          JSON.stringify({ session_id: "sess-1", status: "completed", format_type: "txt", sha256_hash: "abc123" }),
           { status: 200 }
         );
       }

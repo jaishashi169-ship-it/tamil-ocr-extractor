@@ -105,7 +105,7 @@ export function UploadCard({
         </div>
 
         <p className="mt-4 text-xs font-medium text-slate-500 dark:text-slate-400">
-          {t(locale, "uploadHint")} ({MAX_UPLOAD_BYTES.toLocaleString()} bytes)
+          {t(locale, "uploadHint")} ({MAX_UPLOAD_BYTES.toLocaleString("en-US")} bytes)
         </p>
       </div>
 

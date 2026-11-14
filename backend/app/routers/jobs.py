@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.config import get_settings
 from app.database import get_db
+from app.dispatch import dispatch_celery_or_fallback
 from app.models import Draft, Job, UploadSession, User
 from app.storage import storage
 from app.tasks import process_extraction_job_sync, process_extraction_job_task
@@ -51,49 +52,33 @@ def _dispatch_job(
     Falls back to FastAPI BackgroundTasks ONLY when APP_ENV != 'production'
     and ALLOW_BACKGROUND_TASK_FALLBACK is explicitly enabled.
     """
-    current_settings = get_settings()
-    allow_fallback = (
-        current_settings.APP_ENV != "production"
-        and current_settings.ALLOW_BACKGROUND_TASK_FALLBACK
-    )
     job.dispatch_attempts = (job.dispatch_attempts or 0) + 1
-    try:
-        import redis
 
-        redis_client = redis.Redis.from_url(
-            current_settings.CELERY_BROKER_URL,
-            socket_connect_timeout=current_settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
-            socket_timeout=current_settings.REDIS_SOCKET_TIMEOUT_SECONDS,
-        )
-        redis_client.ping()
-        process_extraction_job_task.apply_async(
-            args=[job.id, password],
-            retry=False,
-        )
+    def _on_dispatched() -> None:
         job.dispatch_status = "dispatched"
         db.commit()
-    except Exception:
-        if allow_fallback:
-            job.dispatch_status = "fallback"
-            db.commit()
-            background_tasks.add_task(process_extraction_job_sync, job.id, password)
-            return
 
+    def _on_fallback() -> None:
+        job.dispatch_status = "fallback"
+        db.commit()
+
+    def _on_failed() -> None:
         job.status = "failed"
         job.dispatch_status = "failed"
         job.stage_label = "Dispatch unavailable"
         job.error_message = "Durable job queue is unavailable. Please retry shortly."
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "QUEUE_UNAVAILABLE",
-                "retryable": True,
-                "job_id": job.id,
-                "message": "Durable job queue is unavailable. Please retry shortly.",
-            },
-            headers={"Retry-After": "5"},
-        )
+
+    dispatch_celery_or_fallback(
+        background_tasks=background_tasks,
+        celery_task=process_extraction_job_task,
+        args=[job.id, password],
+        sync_fn=process_extraction_job_sync,
+        on_dispatched=_on_dispatched,
+        on_fallback=_on_fallback,
+        on_failed=_on_failed,
+        resource_id=job.id,
+    )
 
 
 def _serialize_job(job: Job) -> Dict[str, Any]:

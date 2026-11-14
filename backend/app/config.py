@@ -35,7 +35,8 @@ class Settings(BaseSettings):
 
     # Strict 500 MB (500,000,000 bytes) limit & processing quotas
     MAX_UPLOAD_BYTES: int = 500_000_000
-    UPLOAD_CHUNK_BYTES: int = 5_242_880  # 5 MB chunks
+    UPLOAD_CHUNK_BYTES: int = 5_242_880  # 5 MB proxy chunks
+    S3_MULTIPART_PART_BYTES: int = 8_388_608  # 8 MiB direct S3 multipart part size (>= 5 MiB S3 minimum)
     MAX_BATCH_FILES: int = 25
     MAX_PDF_PAGES: int = 500
     MAX_IMAGE_PIXELS: int = 100_000_000

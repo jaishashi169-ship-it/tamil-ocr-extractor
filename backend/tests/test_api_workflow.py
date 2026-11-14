@@ -57,10 +57,12 @@ def test_end_to_end_upload_extract_edit_export_download_delete():
     )
     assert chunk_res.status_code == 200
 
-    # 3. Complete upload
+    # 3. Complete upload (async worker finalization)
     comp_res = client.post(f"/api/v1/uploads/{session_id}/complete", headers=headers)
-    assert comp_res.status_code == 200
-    assert comp_res.json()["sha256_hash"] == orig_sha
+    assert comp_res.status_code in {200, 202}
+    up_status = client.get(f"/api/v1/uploads/{session_id}", headers=headers).json()
+    assert up_status["status"] == "completed"
+    assert up_status["sha256_hash"] == orig_sha
 
     # 4. Start job
     job_res = client.post(
@@ -96,15 +98,17 @@ def test_end_to_end_upload_extract_edit_export_download_delete():
             json={"export_format": fmt, "quality_preset": "high"},
             headers=headers,
         )
-        assert exp_res.status_code == 201
+        assert exp_res.status_code in {201, 202}
         art_id = exp_res.json()["artifact_id"]
-        assert exp_res.json()["file_size_bytes"] > 0
+        art_status = client.get(f"/api/v1/jobs/{job_id}/exports/{art_id}", headers=headers).json()
+        assert art_status["status"] == "completed"
+        assert art_status["file_size_bytes"] > 0
 
         link_res = client.get(f"/api/v1/jobs/{job_id}/exports/{art_id}/link", headers=headers)
         assert link_res.status_code == 200
         dl_res = client.get(link_res.json()["download_url"])
         assert dl_res.status_code == 200
-        assert len(dl_res.content) == exp_res.json()["file_size_bytes"]
+        assert len(dl_res.content) == art_status["file_size_bytes"]
 
     # 8. Download unchanged original & verify hash
     orig_link = client.get(f"/api/v1/jobs/{job_id}/original/link", headers=headers)

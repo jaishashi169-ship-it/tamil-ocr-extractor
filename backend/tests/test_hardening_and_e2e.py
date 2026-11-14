@@ -56,7 +56,7 @@ def _upload_chunks(headers: dict, filename: str, data: bytes, chunk_size: int = 
         idx += 1
 
     comp_res = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
-    assert comp_res.status_code == 200, comp_res.text
+    assert comp_res.status_code in {200, 202}, comp_res.text
     return sid
 
 
@@ -381,7 +381,10 @@ def test_streamed_upload_boundary_resumability_auth_and_sha256(monkeypatch):
             == 200
         )
 
-    comp = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers_a).json()
+    comp_res = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers_a)
+    assert comp_res.status_code in {200, 202}, comp_res.text
+    comp = client.get(f"/api/v1/uploads/{sid}", headers=headers_a).json()
+    assert comp["status"] == "completed"
     assert comp["sha256_hash"] == expected_sha
 
     # Start job & verify unchanged original download SHA-256
@@ -441,7 +444,7 @@ def test_compression_presets_and_export_file_opening():
             json={"export_format": "searchable_pdf", "quality_preset": preset},
             headers=headers,
         )
-        assert exp.status_code == 201, exp.text
+        assert exp.status_code in {201, 202}, exp.text
         link = client.get(f"/api/v1/jobs/{jid}/exports/{exp.json()['artifact_id']}/link", headers=headers).json()
         dl = client.get(link["download_url"])
         assert dl.status_code == 200
@@ -463,7 +466,7 @@ def test_compression_presets_and_export_file_opening():
             json={"export_format": "jpg", "quality_preset": preset},
             headers=headers,
         )
-        assert exp.status_code == 201, exp.text
+        assert exp.status_code in {201, 202}, exp.text
         link = client.get(f"/api/v1/jobs/{jid}/exports/{exp.json()['artifact_id']}/link", headers=headers).json()
         dl = client.get(link["download_url"])
         assert dl.status_code == 200
@@ -480,7 +483,7 @@ def test_compression_presets_and_export_file_opening():
             json={"export_format": fmt, "quality_preset": "high"},
             headers=headers,
         )
-        assert exp.status_code == 201, f"{fmt} failed: {exp.text}"
+        assert exp.status_code in {201, 202}, f"{fmt} failed: {exp.text}"
         link = client.get(f"/api/v1/jobs/{jid}/exports/{exp.json()['artifact_id']}/link", headers=headers).json()
         dl = client.get(link["download_url"])
         assert dl.status_code == 200
@@ -552,6 +555,7 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
         assert init_res.status_code == 201, init_res.text
         body = init_res.json()
         assert body["upload_mode"] == "direct_s3"
+        assert body["chunk_size_bytes"] >= 8_388_608
         sid = body["session_id"]
         mock_create_mpu.assert_called_once()
 
@@ -577,11 +581,12 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
         assert status_res.json()["upload_mode"] == "direct_s3"
         assert status_res.json()["received_chunks"] == [0]
 
-        # 5. Complete S3 multipart upload
+        # 5. Complete S3 multipart upload (worker finalization)
         comp_res = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
-        assert comp_res.status_code == 200, comp_res.text
-        assert comp_res.json()["status"] == "completed"
-        assert comp_res.json()["sha256_hash"] == expected_sha
+        assert comp_res.status_code in {200, 202}, comp_res.text
+        final_status = client.get(f"/api/v1/uploads/{sid}", headers=headers).json()
+        assert final_status["status"] == "completed"
+        assert final_status["sha256_hash"] == expected_sha
         mock_complete_mpu.assert_called_once()
 
         # 6. Abort an in-progress S3 session calls abort_multipart_upload
@@ -598,7 +603,7 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
         assert del_res.status_code == 204
         mock_abort_mpu.assert_called_once()
 
-        # 7. Reject oversized S3 object (> 500 MB) and invalid magic bytes
+        # 7. Reject oversized S3 object (> 500 MB) and invalid magic bytes in worker finalization
         oversize_init = client.post(
             "/api/v1/uploads/init",
             json={
@@ -612,7 +617,9 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
         client.post(f"/api/v1/uploads/{osid}/parts/0", json={"etag": '"e1"'}, headers=headers)
         with patch.object(uploads_router.storage, "head_object_size", return_value=get_settings().MAX_UPLOAD_BYTES + 1):
             over_res = client.post(f"/api/v1/uploads/{osid}/complete", headers=headers)
-            assert over_res.status_code == 413
+            assert over_res.status_code in {200, 202}
+            assert client.get(f"/api/v1/uploads/{osid}", headers=headers).json()["status"] == "aborted"
+            assert client.post("/api/v1/jobs", json={"upload_session_id": osid}, headers=headers).status_code == 400
 
         bad_init = client.post(
             "/api/v1/uploads/init",
@@ -627,7 +634,9 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
         client.post(f"/api/v1/uploads/{bsid}/parts/0", json={"etag": '"e1"'}, headers=headers)
         with patch.object(uploads_router.storage, "read_head_bytes", return_value=b"NOT_A_VALID_PNG_HEADER"):
             bad_res = client.post(f"/api/v1/uploads/{bsid}/complete", headers=headers)
-            assert bad_res.status_code == 415
+            assert bad_res.status_code in {200, 202}
+            assert client.get(f"/api/v1/uploads/{bsid}", headers=headers).json()["status"] == "aborted"
+            assert client.post("/api/v1/jobs", json={"upload_session_id": bsid}, headers=headers).status_code == 400
 
         # 8. Presigned download links for original, export, and batch zip
         job_res = client.post(
@@ -682,7 +691,10 @@ def test_direct_s3_multipart_upload_and_presigned_downloads():
             json={"job_ids": [jid], "export_format": "txt", "quality_preset": "high"},
             headers=headers,
         )
-        assert batch_res.status_code == 200, batch_res.text
-        assert batch_res.json()["direct_storage"] is True
-        assert batch_res.json()["download_url"].startswith("https://s3.example.com/")
+        assert batch_res.status_code in {200, 202}, batch_res.text
+        batch_art_id = batch_res.json()["artifact_id"]
+        batch_link = client.get(f"/api/v1/jobs/{jid}/exports/{batch_art_id}/link", headers=headers)
+        assert batch_link.status_code == 200
+        assert batch_link.json()["direct_storage"] is True
+        assert batch_link.json()["download_url"].startswith("https://s3.example.com/")
         assert mock_presign_dl.call_count >= 3

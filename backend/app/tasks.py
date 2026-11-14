@@ -1,16 +1,20 @@
+import io
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, or_
 
 from app.celery_app import celery_app
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import Job, PageResult
-from app.services.document_model import DocumentModel
+from app.models import ExportArtifact, Job, PageResult, UploadSession, User
+from app.security import detect_format_by_signature
+from app.services.document_model import DocumentModel, PageModel, TextBlock
+from app.services.exporters.export_service import generate_export_bytes
 from app.services.importers import CorruptFileError, PasswordRequiredError
 from app.services.importers.docx_importer import import_docx
 from app.services.importers.image_importer import import_image
@@ -267,3 +271,240 @@ def process_extraction_job_sync(
 @celery_app.task(bind=True, name="app.tasks.process_extraction_job")
 def process_extraction_job_task(self, job_id: str, password: Optional[str] = None) -> None:
     process_extraction_job_sync(job_id, password=password)
+
+
+def build_reviewed_document_model(job: Job, db: Any) -> DocumentModel:
+    pages = (
+        db.query(PageResult)
+        .filter(PageResult.job_id == job.id)
+        .order_by(PageResult.page_number.asc())
+        .all()
+    )
+    page_models: List[PageModel] = []
+    for p in pages:
+        pm = PageModel(**(p.model_json or {"page_number": p.page_number}))
+        if p.edited_text is not None and p.edited_text != p.raw_text:
+            edited_paras = [para.strip() for para in p.edited_text.split("\n\n") if para.strip()]
+            new_blocks: List[TextBlock] = []
+            for idx, para in enumerate(edited_paras):
+                orig_blk = pm.blocks[idx] if idx < len(pm.blocks) else None
+                new_blocks.append(
+                    TextBlock(
+                        id=orig_blk.id if orig_blk else f"edited-{p.page_number}-{idx}",
+                        block_type=orig_blk.block_type if orig_blk else "paragraph",
+                        heading_level=orig_blk.heading_level if orig_blk else None,
+                        text=para,
+                        raw_ocr_text=orig_blk.raw_ocr_text if orig_blk else None,
+                        language=pm.language_detected,
+                        extraction_method="user_edited",
+                        confidence=orig_blk.confidence if orig_blk else pm.confidence_avg,
+                        bbox=orig_blk.bbox if orig_blk else None,
+                        source_ref=orig_blk.source_ref if orig_blk else None,
+                    )
+                )
+            pm.blocks = new_blocks
+        page_models.append(pm)
+
+    return DocumentModel(
+        job_id=job.id,
+        source_filename=job.original_filename,
+        format_type=job.format_type,
+        conversion_mode=(job.settings_json or {}).get("conversion_mode", "clean_editable"),
+        pages=page_models,
+        metadata=job.metadata_json or {},
+    )
+
+
+def finalize_upload_sync(session_id: str) -> None:
+    """
+    Durable worker finalization for uploads:
+    - Completes S3 multipart or assembles local chunks.
+    - Enforces 500 MB size limit and magic-byte content signature.
+    - Computes streaming SHA-256 outside FastAPI request handlers.
+    - Marks session 'completed' only after all validation succeeds.
+    """
+    settings = get_settings()
+    db = SessionLocal()
+    try:
+        session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
+        if not session or session.status in {"completed", "aborted"}:
+            return
+
+        if session.s3_upload_id and session.storage_key and storage.is_s3():
+            dest_key = session.storage_key
+            parts = sorted(session.s3_parts_json or [], key=lambda p: p.get("PartNumber", 0))
+            expected_parts = list(range(1, session.total_chunks + 1))
+            if [p.get("PartNumber") for p in parts] != expected_parts:
+                session.status = "failed"
+                db.commit()
+                return
+
+            storage.complete_multipart_upload(dest_key, session.s3_upload_id, parts)
+            actual_bytes = storage.head_object_size(dest_key)
+            if actual_bytes > settings.MAX_UPLOAD_BYTES:
+                storage.delete_key(dest_key)
+                session.status = "aborted"
+                db.commit()
+                return
+
+            header = storage.read_head_bytes(dest_key, 4096)
+            fmt, err = detect_format_by_signature(header, session.filename)
+            if err or not fmt:
+                storage.delete_key(dest_key)
+                session.status = "aborted"
+                db.commit()
+                return
+
+            _, sha256_hex = storage.compute_sha256_streaming(dest_key)
+        else:
+            dest_key = f"uploads/{session.user_id}/{session.id}/{session.filename}"
+            actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
+            if actual_bytes > settings.MAX_UPLOAD_BYTES:
+                storage.delete_key(dest_key)
+                session.status = "aborted"
+                db.commit()
+                return
+
+            assembled_path = storage.get_local_file(dest_key)
+            with open(assembled_path, "rb") as f:
+                header = f.read(4096)
+            fmt, err = detect_format_by_signature(header, session.filename)
+            if err or not fmt:
+                storage.delete_key(dest_key)
+                session.status = "aborted"
+                db.commit()
+                return
+
+        session.storage_key = dest_key
+        session.sha256_hash = sha256_hex
+        session.format_type = fmt
+        session.expected_size_bytes = actual_bytes
+        session.status = "completed"
+        db.commit()
+    except Exception:
+        db.rollback()
+        session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
+        if session and session.status == "processing":
+            session.status = "failed"
+            db.commit()
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True, name="app.tasks.finalize_upload")
+def finalize_upload_task(self, session_id: str) -> None:
+    finalize_upload_sync(session_id)
+
+
+def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = None) -> None:
+    """Generate a single-job export artifact in a worker and upload to private storage."""
+    db = SessionLocal()
+    try:
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if not art or art.status == "completed":
+            return
+        job = db.query(Job).filter(Job.id == art.job_id).first()
+        user = db.query(User).filter(User.id == art.user_id).first()
+        if not job or job.status != "completed":
+            art.status = "failed"
+            db.commit()
+            return
+
+        doc_model = build_reviewed_document_model(job, db)
+        data_bytes, ext, warnings, baseline_bytes, savings_pct = generate_export_bytes(
+            doc_model, art.export_format, art.quality_preset, options or {}
+        )
+        if not data_bytes:
+            art.status = "failed"
+            db.commit()
+            return
+
+        stem = Path(job.original_filename).stem
+        storage_key = f"jobs/{job.id}/exports/{stem}_{art.export_format}_{art.quality_preset}_{art.id[:8]}.{ext}"
+        storage.save_bytes(storage_key, data_bytes)
+
+        retention_days = user.retention_days if user else get_settings().DEFAULT_RETENTION_DAYS
+        art.storage_key = storage_key
+        art.file_size_bytes = len(data_bytes)
+        art.uncompressed_size_bytes = baseline_bytes
+        art.savings_percent = savings_pct
+        art.warnings_json = warnings
+        art.status = "completed"
+        art.expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)
+        db.commit()
+    except Exception:
+        db.rollback()
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if art:
+            art.status = "failed"
+            db.commit()
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True, name="app.tasks.generate_export")
+def generate_export_task(self, artifact_id: str, options: Optional[Dict[str, Any]] = None) -> None:
+    generate_export_sync(artifact_id, options=options)
+
+
+def generate_batch_zip_sync(
+    artifact_id: str,
+    user_id: str,
+    job_ids: List[str],
+    export_format: str,
+    quality_preset: str,
+) -> None:
+    """Generate a multi-job ZIP archive in a worker and upload to private storage."""
+    db = SessionLocal()
+    try:
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if not art or art.status == "completed":
+            return
+        jobs = (
+            db.query(Job)
+            .filter(Job.id.in_(job_ids), Job.user_id == user_id, Job.status == "completed")
+            .all()
+        )
+        if not jobs:
+            art.status = "failed"
+            db.commit()
+            return
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for job in jobs:
+                doc_model = build_reviewed_document_model(job, db)
+                data_bytes, ext, _, _, _ = generate_export_bytes(doc_model, export_format, quality_preset, {})
+                stem = Path(job.original_filename).stem
+                zf.writestr(f"{stem}_{job.id[:6]}.{ext}", data_bytes)
+
+        zip_bytes = buf.getvalue()
+        key = f"batches/{user_id}/batch_{art.id[:8]}.zip"
+        storage.save_bytes(key, zip_bytes)
+
+        art.storage_key = key
+        art.file_size_bytes = len(zip_bytes)
+        art.uncompressed_size_bytes = len(zip_bytes)
+        art.savings_percent = 0.0
+        art.status = "completed"
+        db.commit()
+    except Exception:
+        db.rollback()
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if art:
+            art.status = "failed"
+            db.commit()
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True, name="app.tasks.generate_batch_zip")
+def generate_batch_zip_task(
+    self,
+    artifact_id: str,
+    user_id: str,
+    job_ids: List[str],
+    export_format: str,
+    quality_preset: str,
+) -> None:
+    generate_batch_zip_sync(artifact_id, user_id, job_ids, export_format, quality_preset)

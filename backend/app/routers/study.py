@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, StudyItem, StudyProject, User
-from app.routers.exports import _build_reviewed_document_model
+from app.tasks import build_reviewed_document_model as _build_reviewed_document_model
 from app.services.study.ai_provider import AIProviderUnconfiguredError, get_ai_provider_status
 from app.services.study.exporter import export_study_project
 from app.services.study.pipeline import run_study_pipeline

@@ -94,23 +94,27 @@ export async function uploadFileInChunks(
 
   const token = await ensureAuthToken();
   let sessionId = callbacks.resumeSessionId;
-  let totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
+  let effectiveChunkSize = CHUNK_SIZE_BYTES;
+  let totalChunks = Math.max(1, Math.ceil(file.size / effectiveChunkSize));
   let receivedSet = new Set<number>();
   let uploadMode: "proxy" | "direct_s3" = "proxy";
 
   if (sessionId) {
     const statusRes = await apiFetch<{
       session_id: string;
+      chunk_size_bytes: number;
       total_chunks: number;
       received_chunks: number[];
       upload_mode?: "proxy" | "direct_s3";
     }>(`/uploads/${sessionId}`);
+    effectiveChunkSize = statusRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
     totalChunks = statusRes.total_chunks;
     receivedSet = new Set(statusRes.received_chunks);
     uploadMode = statusRes.upload_mode || "proxy";
   } else {
     const initRes = await apiFetch<{
       session_id: string;
+      chunk_size_bytes: number;
       total_chunks: number;
       upload_mode?: "proxy" | "direct_s3";
     }>("/uploads/init", {
@@ -122,6 +126,7 @@ export async function uploadFileInChunks(
       }),
     });
     sessionId = initRes.session_id;
+    effectiveChunkSize = initRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
     totalChunks = initRes.total_chunks;
     uploadMode = initRes.upload_mode || "proxy";
     callbacks.onSessionCreated?.(sessionId);
@@ -137,13 +142,13 @@ export async function uploadFileInChunks(
       throw new Error("UPLOAD_PAUSED");
     }
     if (receivedSet.has(idx)) {
-      const doneBytes = Math.min(file.size, (idx + 1) * CHUNK_SIZE_BYTES);
+      const doneBytes = Math.min(file.size, (idx + 1) * effectiveChunkSize);
       callbacks.onProgress(doneBytes, file.size, Math.round((doneBytes / file.size) * 100));
       continue;
     }
 
-    const start = idx * CHUNK_SIZE_BYTES;
-    const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
+    const start = idx * effectiveChunkSize;
+    const end = Math.min(file.size, start + effectiveChunkSize);
     const slice = file.slice(start, end);
 
     if (uploadMode === "direct_s3") {
@@ -185,11 +190,29 @@ export async function uploadFileInChunks(
     callbacks.onProgress(end, file.size, Math.round((end / file.size) * 100));
   }
 
-  const completed = await apiFetch<{
+  let completed = await apiFetch<{
     session_id: string;
+    status: string;
     format_type: string;
     sha256_hash: string;
   }>(`/uploads/${sessionId}/complete`, { method: "POST" });
+
+  const deadline = Date.now() + 300_000;
+  while (completed.status === "processing") {
+    if (Date.now() > deadline) {
+      throw new Error("Upload finalization timed out");
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    completed = await apiFetch<{
+      session_id: string;
+      status: string;
+      format_type: string;
+      sha256_hash: string;
+    }>(`/uploads/${sessionId}`);
+  }
+  if (completed.status !== "completed") {
+    throw new Error(`Upload validation failed (status: ${completed.status})`);
+  }
 
   return {
     sessionId: completed.session_id,
@@ -321,16 +344,31 @@ export async function applyHeadersFooters(jobId: string, headers: string[], foot
   });
 }
 
+async function pollExportUntilReady(jobId: string, artifactId: string): Promise<ExportArtifactRecord> {
+  const deadline = Date.now() + 300_000;
+  while (true) {
+    const art = await apiFetch<ExportArtifactRecord>(`/jobs/${jobId}/exports/${artifactId}`);
+    if (art.status === "completed") return art;
+    if (art.status === "failed") throw new Error("Export generation failed");
+    if (Date.now() > deadline) throw new Error("Export generation timed out");
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
 export async function createExport(
   jobId: string,
   exportFormat: string,
   qualityPreset: string,
   options: Record<string, unknown> = {}
 ): Promise<ExportArtifactRecord> {
-  return apiFetch(`/jobs/${jobId}/exports`, {
+  const created = await apiFetch<ExportArtifactRecord>(`/jobs/${jobId}/exports`, {
     method: "POST",
     body: JSON.stringify({ export_format: exportFormat, quality_preset: qualityPreset, options }),
   });
+  if (created.status === "processing") {
+    return pollExportUntilReady(jobId, created.artifact_id);
+  }
+  return created;
 }
 
 function resolveDownloadUrl(downloadUrl: string): string {
@@ -352,11 +390,21 @@ export async function getOriginalDownloadUrl(jobId: string): Promise<string> {
 }
 
 export async function createBatchZip(jobIds: string[], exportFormat = "txt", qualityPreset = "high") {
-  const res = await apiFetch<{ artifact_id: string; file_size_bytes: number; download_url: string }>("/jobs/batch/zip", {
-    method: "POST",
-    body: JSON.stringify({ job_ids: jobIds, export_format: exportFormat, quality_preset: qualityPreset }),
-  });
-  return { ...res, full_url: resolveDownloadUrl(res.download_url) };
+  const res = await apiFetch<{ artifact_id: string; job_id: string; status: string; file_size_bytes: number }>(
+    "/jobs/batch/zip",
+    {
+      method: "POST",
+      body: JSON.stringify({ job_ids: jobIds, export_format: exportFormat, quality_preset: qualityPreset }),
+    }
+  );
+  const ready = res.status === "processing" ? await pollExportUntilReady(res.job_id, res.artifact_id) : res;
+  const linkRes = await apiFetch<{ download_url: string }>(`/jobs/${res.job_id}/exports/${res.artifact_id}/link`);
+  return {
+    artifact_id: res.artifact_id,
+    file_size_bytes: ready.file_size_bytes,
+    download_url: linkRes.download_url,
+    full_url: resolveDownloadUrl(linkRes.download_url),
+  };
 }
 
 export async function getStudyProviderStatus(): Promise<{

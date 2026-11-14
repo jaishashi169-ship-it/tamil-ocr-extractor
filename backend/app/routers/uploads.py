@@ -1,6 +1,6 @@
 import math
 from typing import List
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.config import get_settings
 from app.database import get_db
+from app.dispatch import dispatch_celery_or_fallback
 from app.models import Job, UploadSession, User
 from app.security import detect_format_by_signature, sanitize_filename
 from app.storage import storage
+from app.tasks import finalize_upload_sync, finalize_upload_task
 
 router = APIRouter(prefix="/uploads", tags=["Uploads"])
 settings = get_settings()
@@ -67,13 +69,19 @@ def init_upload(
         )
 
     safe_name = sanitize_filename(payload.filename)
-    total_chunks = max(1, math.ceil(payload.expected_size_bytes / payload.chunk_size_bytes))
+    is_s3 = storage.is_s3()
+    effective_chunk_size = (
+        max(settings.S3_MULTIPART_PART_BYTES, payload.chunk_size_bytes)
+        if is_s3
+        else payload.chunk_size_bytes
+    )
+    total_chunks = max(1, math.ceil(payload.expected_size_bytes / effective_chunk_size))
 
     session = UploadSession(
         user_id=current_user.id,
         filename=safe_name,
         expected_size_bytes=payload.expected_size_bytes,
-        chunk_size_bytes=payload.chunk_size_bytes,
+        chunk_size_bytes=effective_chunk_size,
         total_chunks=total_chunks,
         received_chunks=[],
         s3_parts_json=[],
@@ -83,7 +91,7 @@ def init_upload(
     db.flush()
 
     upload_mode = "proxy"
-    if storage.is_s3():
+    if is_s3:
         dest_key = f"uploads/{current_user.id}/{session.id}/{safe_name}"
         session.storage_key = dest_key
         session.s3_upload_id = storage.create_multipart_upload(dest_key)
@@ -292,9 +300,10 @@ def pause_upload(
     )
 
 
-@router.post("/{session_id}/complete", response_model=UploadSessionResponse)
+@router.post("/{session_id}/complete", response_model=UploadSessionResponse, status_code=status.HTTP_202_ACCEPTED)
 def complete_upload(
     session_id: str,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -306,6 +315,21 @@ def complete_upload(
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
 
+    if session.status == "completed":
+        return UploadSessionResponse(
+            session_id=session.id,
+            filename=session.filename,
+            expected_size_bytes=session.expected_size_bytes,
+            received_bytes=session.expected_size_bytes,
+            chunk_size_bytes=session.chunk_size_bytes,
+            total_chunks=session.total_chunks,
+            received_chunks=session.received_chunks or [],
+            status=session.status,
+            format_type=session.format_type,
+            sha256_hash=session.sha256_hash,
+            upload_mode="direct_s3" if session.s3_upload_id else "proxy",
+        )
+
     received = set(session.received_chunks or [])
     missing = [i for i in range(session.total_chunks) if i not in received]
     if missing:
@@ -314,56 +338,21 @@ def complete_upload(
             detail=f"Upload incomplete. Missing {len(missing)} chunk(s), starting at {missing[0]}.",
         )
 
-    if session.s3_upload_id and session.storage_key and storage.is_s3():
-        dest_key = session.storage_key
-        storage.complete_multipart_upload(dest_key, session.s3_upload_id, session.s3_parts_json or [])
-        actual_bytes = storage.head_object_size(dest_key)
-        if actual_bytes > settings.MAX_UPLOAD_BYTES:
-            storage.delete_key(dest_key)
-            session.status = "aborted"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Assembled file ({actual_bytes:,} bytes) exceeds 500 MB limit ({settings.MAX_UPLOAD_BYTES:,} bytes).",
-            )
-        header = storage.read_head_bytes(dest_key, 4096)
-        fmt, err = detect_format_by_signature(header, session.filename)
-        if err or not fmt:
-            storage.delete_key(dest_key)
-            session.status = "aborted"
-            db.commit()
-            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=err or "Unsupported file format")
-        _, sha256_hex = storage.compute_sha256_streaming(dest_key)
-    else:
-        dest_key = f"uploads/{current_user.id}/{session.id}/{session.filename}"
-        actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
-
-        if actual_bytes > settings.MAX_UPLOAD_BYTES:
-            storage.delete_key(dest_key)
-            session.status = "aborted"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Assembled file ({actual_bytes:,} bytes) exceeds 500 MB limit ({settings.MAX_UPLOAD_BYTES:,} bytes).",
-            )
-
-        # Validate magic-byte content signature as well as extension
-        assembled_path = storage.get_local_file(dest_key)
-        with open(assembled_path, "rb") as f:
-            header = f.read(4096)
-        fmt, err = detect_format_by_signature(header, session.filename)
-        if err or not fmt:
-            storage.delete_key(dest_key)
-            session.status = "aborted"
-            db.commit()
-            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=err or "Unsupported file format")
-
-    session.storage_key = dest_key
-    session.sha256_hash = sha256_hex
-    session.format_type = fmt
-    session.expected_size_bytes = actual_bytes
-    session.status = "completed"
+    session.status = "processing"
     db.commit()
+
+    def _on_failed() -> None:
+        session.status = "failed"
+        db.commit()
+
+    dispatch_celery_or_fallback(
+        background_tasks=background_tasks,
+        celery_task=finalize_upload_task,
+        args=[session.id],
+        sync_fn=finalize_upload_sync,
+        on_failed=_on_failed,
+        resource_id=session.id,
+    )
     db.refresh(session)
 
     received_bytes = (
