@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.database import engine, get_db
 from app.dispatch import _redis_kwargs_for_url, is_broker_reachable
 from app.models import Job, SystemSetting, User
+from app.services.retention import cleanup_expired_resources, get_storage_budget_snapshot
 from app.services.tamil_utils import SUPPORTED_LEGACY_ENCODINGS
 from app.storage import storage
 
@@ -56,8 +57,14 @@ def _safe_ocr_status() -> Dict[str, Any]:
             "execution_mode": "worker_daemon",
             "verified_locally": False,
             "verified_worker": True,
+            "verification_type": worker_status.get("verification_type", "synthetic_ocr_execution_smoke_test"),
+            "is_synthetic_smoke_test": bool(worker_status.get("is_synthetic_smoke_test", True)),
             "configured_languages": ["eng", "tam"],
             "languages": worker_status.get("languages", []),
+            "tamil_cer": worker_status.get("tamil_cer"),
+            "tamil_wer": worker_status.get("tamil_wer"),
+            "english_cer": worker_status.get("english_cer"),
+            "english_wer": worker_status.get("english_wer"),
             "registered_tasks": worker_status.get("registered_tasks", []),
             "updated_at": worker_status.get("updated_at"),
         }
@@ -167,6 +174,7 @@ class UpdateQuotasRequest(BaseModel):
     max_upload_bytes: int = Field(default=settings.MAX_UPLOAD_BYTES, ge=1_000_000, le=500_000_000)
     default_retention_days: int = Field(default=settings.DEFAULT_RETENTION_DAYS, ge=1, le=365)
     user_storage_quota_bytes: int = Field(default=settings.USER_STORAGE_QUOTA_BYTES, ge=50_000_000)
+    total_storage_budget_bytes: int = Field(default=settings.TOTAL_STORAGE_BUDGET_BYTES, ge=100_000_000)
 
 
 @router.get("/health/ready")
@@ -184,6 +192,9 @@ def get_capabilities():
         "app_name": settings.APP_NAME,
         "max_upload_bytes": settings.MAX_UPLOAD_BYTES,
         "upload_chunk_bytes": settings.UPLOAD_CHUNK_BYTES,
+        "user_storage_quota_bytes": settings.USER_STORAGE_QUOTA_BYTES,
+        "total_storage_budget_bytes": settings.TOTAL_STORAGE_BUDGET_BYTES,
+        "storage_backend": settings.STORAGE_BACKEND.lower(),
         "max_batch_files": settings.MAX_BATCH_FILES,
         "max_pdf_pages": settings.MAX_PDF_PAGES,
         "installed_ocr_languages": ocr["languages"],
@@ -208,6 +219,7 @@ def get_admin_overview(
     status_counts = dict(db.query(Job.status, func.count(Job.id)).group_by(Job.status).all())
     avg_duration_ms = db.query(func.avg(Job.duration_ms)).filter(Job.duration_ms.isnot(None)).scalar()
     total_users = db.query(func.count(User.id)).scalar() or 0
+    budget_snap = get_storage_budget_snapshot(db)
 
     return {
         "jobs_by_status": {
@@ -218,7 +230,7 @@ def get_admin_overview(
             "failed": status_counts.get("failed", 0),
         },
         "avg_processing_duration_ms": round(float(avg_duration_ms), 1) if avg_duration_ms else 0.0,
-        "storage_usage_bytes": storage.get_total_usage_bytes(),
+        "storage_usage_bytes": budget_snap["total_used_bytes"],
         "total_users": total_users,
         "worker_health": {
             "status": "healthy",
@@ -230,8 +242,20 @@ def get_admin_overview(
             "max_upload_bytes": settings.MAX_UPLOAD_BYTES,
             "default_retention_days": settings.DEFAULT_RETENTION_DAYS,
             "user_storage_quota_bytes": settings.USER_STORAGE_QUOTA_BYTES,
+            "total_storage_budget_bytes": settings.TOTAL_STORAGE_BUDGET_BYTES,
         },
     }
+
+
+@router.post("/admin/retention/cleanup")
+def trigger_retention_cleanup(
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Trigger immediate retention cleanup of expired jobs, exports, and stale upload sessions."""
+    summary = cleanup_expired_resources(db)
+    budget = get_storage_budget_snapshot(db)
+    return {"cleaned": summary, "storage_budget": budget}
 
 
 @router.put("/admin/quotas")

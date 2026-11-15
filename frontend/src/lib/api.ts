@@ -180,7 +180,7 @@ export async function uploadFileInChunks(
   let effectiveChunkSize = CHUNK_SIZE_BYTES;
   let totalChunks = Math.max(1, Math.ceil(file.size / effectiveChunkSize));
   let receivedSet = new Set<number>();
-  let uploadMode: "proxy" | "direct_s3" = "proxy";
+  let uploadMode: "proxy" | "direct_s3" | "direct_blob" = "proxy";
 
   if (sessionId) {
     const statusRes = await apiFetch<{
@@ -188,7 +188,7 @@ export async function uploadFileInChunks(
       chunk_size_bytes: number;
       total_chunks: number;
       received_chunks: number[];
-      upload_mode?: "proxy" | "direct_s3";
+      upload_mode?: "proxy" | "direct_s3" | "direct_blob";
     }>(`/uploads/${sessionId}`);
     effectiveChunkSize = statusRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
     totalChunks = statusRes.total_chunks;
@@ -199,7 +199,7 @@ export async function uploadFileInChunks(
       session_id: string;
       chunk_size_bytes: number;
       total_chunks: number;
-      upload_mode?: "proxy" | "direct_s3";
+      upload_mode?: "proxy" | "direct_s3" | "direct_blob";
     }>("/uploads/init", {
       method: "POST",
       body: JSON.stringify({
@@ -234,26 +234,34 @@ export async function uploadFileInChunks(
     const end = Math.min(file.size, start + effectiveChunkSize);
     const slice = file.slice(start, end);
 
-    if (uploadMode === "direct_s3") {
-      const partUrlRes = await apiFetch<{ upload_url: string; part_number: number }>(
-        `/uploads/${sessionId}/part-url/${idx}`
-      );
-      const s3Res = await fetch(partUrlRes.upload_url, {
-        method: "PUT",
+    if (uploadMode === "direct_s3" || uploadMode === "direct_blob") {
+      const partUrlRes = await apiFetch<{
+        upload_url: string;
+        part_number: number;
+        method?: string;
+        headers?: Record<string, string>;
+      }>(`/uploads/${sessionId}/part-url/${idx}`);
+      const directRes = await fetch(partUrlRes.upload_url, {
+        method: partUrlRes.method || "PUT",
+        headers: partUrlRes.headers || undefined,
         body: slice,
       });
-      if (!s3Res.ok) {
-        throw new Error(`Direct storage upload failed for chunk ${idx} (${s3Res.status})`);
+      if (!directRes.ok) {
+        throw new Error(`Direct storage upload failed for chunk ${idx} (${directRes.status})`);
       }
-      const etag = s3Res.headers.get("ETag") || s3Res.headers.get("etag") || "";
+      let etag = directRes.headers.get("ETag") || directRes.headers.get("etag") || "";
+      if (!etag && uploadMode === "direct_blob") {
+        const bodyJson = await directRes.json().catch(() => ({}));
+        etag = bodyJson.etag || bodyJson.ETag || "";
+      }
       if (!etag) {
         throw new Error(
-          `Direct storage response missing ETag header for chunk ${idx}; verify S3 CORS ExposeHeaders includes ETag`
+          `Direct storage response missing ETag for chunk ${idx}`
         );
       }
       await apiFetch(`/uploads/${sessionId}/parts/${idx}`, {
         method: "POST",
-        body: JSON.stringify({ etag }),
+        body: JSON.stringify({ etag, size_bytes: slice.size }),
       });
     } else {
       const formData = new FormData();

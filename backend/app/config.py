@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     ALLOW_BACKGROUND_TASK_FALLBACK: bool = True
 
     # Private Storage
-    STORAGE_BACKEND: str = "local"  # "local" or "s3"
+    STORAGE_BACKEND: str = "local"  # "local", "s3", or "vercel_blob"
     LOCAL_STORAGE_ROOT: str = "./private_storage"
     S3_ENDPOINT_URL: str = "http://localhost:9000"
     S3_PUBLIC_ENDPOINT_URL: str = ""
@@ -33,11 +33,13 @@ class Settings(BaseSettings):
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
     S3_REGION: str = "us-east-1"
+    BLOB_READ_WRITE_TOKEN: str = ""
+    VERCEL_BLOB_API_URL: str = "https://vercel.com/api/blob"
 
     # Strict 500 MB (500,000,000 bytes) limit & processing quotas
     MAX_UPLOAD_BYTES: int = 500_000_000
     UPLOAD_CHUNK_BYTES: int = 5_242_880  # 5 MB proxy chunks
-    S3_MULTIPART_PART_BYTES: int = 8_388_608  # 8 MiB direct S3 multipart part size (>= 5 MiB S3 minimum)
+    S3_MULTIPART_PART_BYTES: int = 8_388_608  # 8 MiB direct multipart part size (>= 5 MiB minimum)
     MAX_BATCH_FILES: int = 25
     MAX_PDF_PAGES: int = 500
     MAX_IMAGE_PIXELS: int = 100_000_000
@@ -45,7 +47,8 @@ class Settings(BaseSettings):
     JOB_LEASE_SECONDS: int = 300
     WORKER_MAX_MEMORY_MB: int = 2048
     DEFAULT_RETENTION_DAYS: int = 7
-    USER_STORAGE_QUOTA_BYTES: int = 5_000_000_000  # 5 GB default per user
+    USER_STORAGE_QUOTA_BYTES: int = 750_000_000  # 750 MB per user (fits 500 MB upload + exports within 1 GB Hobby cap)
+    TOTAL_STORAGE_BUDGET_BYTES: int = 850_000_000  # 850 MB total storage budget ceiling (guards 1 GB Hobby cap)
 
     # Binaries
     TESSERACT_CMD: str = "tesseract"
@@ -84,19 +87,33 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "APP_ENV=production requires managed PostgreSQL; SQLite or /tmp database fallback is not permitted."
                 )
-            if self.STORAGE_BACKEND.lower() != "s3":
+            backend = self.STORAGE_BACKEND.lower()
+            if backend not in {"s3", "vercel_blob"}:
                 raise ValueError(
-                    "APP_ENV=production requires durable private object storage (STORAGE_BACKEND=s3); local/tmp storage is not permitted."
+                    "APP_ENV=production requires durable private object storage (STORAGE_BACKEND=vercel_blob or STORAGE_BACKEND=s3); local/tmp storage is not permitted."
                 )
-            if (
-                not self.S3_BUCKET_NAME
-                or not self.S3_ACCESS_KEY
-                or not self.S3_SECRET_KEY
-                or self.S3_ACCESS_KEY == "minioadmin"
-            ):
-                raise ValueError(
-                    "APP_ENV=production requires valid S3 credentials and bucket (default minioadmin placeholder is not permitted)."
-                )
+            if backend == "s3":
+                if (
+                    not self.S3_BUCKET_NAME
+                    or not self.S3_ACCESS_KEY
+                    or not self.S3_SECRET_KEY
+                    or self.S3_ACCESS_KEY == "minioadmin"
+                ):
+                    raise ValueError(
+                        "APP_ENV=production with STORAGE_BACKEND=s3 requires valid S3 credentials and bucket (default minioadmin placeholder is not permitted)."
+                    )
+            elif backend == "vercel_blob":
+                parts = (self.BLOB_READ_WRITE_TOKEN or "").strip().split("_")
+                if (
+                    not self.BLOB_READ_WRITE_TOKEN
+                    or not self.BLOB_READ_WRITE_TOKEN.startswith("vercel_blob_rw_")
+                    or len(parts) < 5
+                    or not parts[3]
+                    or not parts[4]
+                ):
+                    raise ValueError(
+                        "APP_ENV=production with STORAGE_BACKEND=vercel_blob requires a valid server-side BLOB_READ_WRITE_TOKEN (vercel_blob_rw_<storeId>_<secret>)."
+                    )
 
 
 @lru_cache

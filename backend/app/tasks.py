@@ -22,6 +22,7 @@ from app.services.importers.pdf_importer import import_pdf
 from app.services.importers.psd_importer import import_psd
 from app.services.importers.text_importer import import_structured_or_text
 from app.services.ocr_engine import OCROptions, OCRUnavailableError
+from app.services.retention import enforce_storage_budget_and_quota
 from app.storage import storage
 
 
@@ -61,6 +62,7 @@ def process_extraction_job_sync(
     lease_expires_at = now_utc + timedelta(seconds=settings.JOB_LEASE_SECONDS)
 
     db = SessionLocal()
+    original_key_for_scratch_cleanup: Optional[str] = None
     try:
         claim_filter = and_(
             Job.id == job_id,
@@ -108,6 +110,7 @@ def process_extraction_job_sync(
             multi_column=bool(settings_dict.get("multi_column", True)),
         )
 
+        original_key_for_scratch_cleanup = job.original_storage_key
         file_path = storage.get_local_file(job.original_storage_key)
 
         def _on_progress(current_page: int, total_pages: int, label: str) -> None:
@@ -265,6 +268,7 @@ def process_extraction_job_sync(
             },
         )
     finally:
+        storage.cleanup_scratch_key(original_key_for_scratch_cleanup)
         db.close()
 
 
@@ -283,12 +287,13 @@ def finalize_upload_sync(session_id: str) -> None:
     """
     settings = get_settings()
     db = SessionLocal()
+    original_key_for_scratch_cleanup: Optional[str] = None
     try:
         session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
         if not session or session.status in {"completed", "aborted"}:
             return
 
-        if session.s3_upload_id and session.storage_key and storage.is_s3():
+        if session.s3_upload_id and session.storage_key and storage.is_direct_multipart():
             dest_key = session.storage_key
             parts = sorted(session.s3_parts_json or [], key=lambda p: p.get("PartNumber", 0))
             expected_parts = list(range(1, session.total_chunks + 1))
@@ -316,6 +321,7 @@ def finalize_upload_sync(session_id: str) -> None:
             _, sha256_hex = storage.compute_sha256_streaming(dest_key)
         else:
             dest_key = f"uploads/{session.user_id}/{session.id}/{session.filename}"
+            original_key_for_scratch_cleanup = dest_key
             actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
             if actual_bytes > settings.MAX_UPLOAD_BYTES:
                 storage.delete_key(dest_key)
@@ -346,6 +352,7 @@ def finalize_upload_sync(session_id: str) -> None:
             session.status = "failed"
             db.commit()
     finally:
+        storage.cleanup_scratch_key(original_key_for_scratch_cleanup)
         db.close()
 
 
@@ -357,6 +364,7 @@ def finalize_upload_task(self, session_id: str) -> None:
 def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = None) -> None:
     """Generate a single-job export artifact in a worker and upload to private storage."""
     db = SessionLocal()
+    original_key_for_scratch_cleanup: Optional[str] = None
     try:
         art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
         if not art or art.status == "completed":
@@ -376,6 +384,9 @@ def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = N
             art.status = "failed"
             db.commit()
             return
+
+        if user is not None:
+            enforce_storage_budget_and_quota(db, user, len(data_bytes))
 
         stem = Path(job.original_filename).stem
         storage_key = f"jobs/{job.id}/exports/{stem}_{art.export_format}_{art.quality_preset}_{art.id[:8]}.{ext}"
@@ -397,6 +408,7 @@ def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = N
             art.status = "failed"
             db.commit()
     finally:
+        storage.cleanup_scratch_key(original_key_for_scratch_cleanup)
         db.close()
 
 
@@ -414,6 +426,7 @@ def generate_batch_zip_sync(
 ) -> None:
     """Generate a multi-job ZIP archive in a worker and upload to private storage."""
     db = SessionLocal()
+    original_key_for_scratch_cleanup: Optional[str] = None
     try:
         art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
         if not art or art.status == "completed":
@@ -437,6 +450,9 @@ def generate_batch_zip_sync(
                 zf.writestr(f"{stem}_{job.id[:6]}.{ext}", data_bytes)
 
         zip_bytes = buf.getvalue()
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is not None:
+            enforce_storage_budget_and_quota(db, user, len(zip_bytes))
         key = f"batches/{user_id}/batch_{art.id[:8]}.zip"
         storage.save_bytes(key, zip_bytes)
 
@@ -453,6 +469,7 @@ def generate_batch_zip_sync(
             art.status = "failed"
             db.commit()
     finally:
+        storage.cleanup_scratch_key(original_key_for_scratch_cleanup)
         db.close()
 
 
@@ -472,24 +489,65 @@ WORKER_STATUS_REDIS_KEY = "doc_studio:worker:status"
 _cached_worker_ocr_probe: Optional[Dict[str, Any]] = None
 
 
-def _normalized_similarity(actual: str, expected: str) -> float:
-    import difflib
+def _levenshtein_distance(seq_a: List[Any], seq_b: List[Any]) -> int:
+    """Compute standard Levenshtein edit distance (substitutions + insertions + deletions)."""
+    if not seq_a:
+        return len(seq_b)
+    if not seq_b:
+        return len(seq_a)
+    prev = list(range(len(seq_b) + 1))
+    for i, item_a in enumerate(seq_a, start=1):
+        curr = [i] + [0] * len(seq_b)
+        for j, item_b in enumerate(seq_b, start=1):
+            cost = 0 if item_a == item_b else 1
+            curr[j] = min(
+                prev[j] + 1,      # deletion
+                curr[j - 1] + 1,  # insertion
+                prev[j - 1] + cost,  # substitution
+            )
+        prev = curr
+    return prev[-1]
+
+
+def compute_cer_and_wer(actual: str, expected: str) -> Dict[str, float]:
+    """
+    Compute standard edit-distance Character Error Rate (CER) and Word Error Rate (WER):
+    - CER = (S_c + D_c + I_c) / N_c
+    - WER = (S_w + D_w + I_w) / N_w
+    """
     import unicodedata
 
-    def _clean(val: str) -> str:
+    def _normalize_text(val: str) -> str:
         norm = unicodedata.normalize("NFC", val or "")
-        return "".join(ch for ch in norm if not ch.isspace() and ch not in ("\u200c", "\u200d")).upper()
+        cleaned = "".join(ch for ch in norm if ch not in ("\u200c", "\u200d"))
+        return " ".join(cleaned.split()).upper()
 
-    a, b = _clean(actual), _clean(expected)
-    if not b:
-        return 1.0
-    if not a:
-        return 0.0
-    return round(difflib.SequenceMatcher(None, a, b).ratio(), 4)
+    hyp = _normalize_text(actual)
+    ref = _normalize_text(expected)
+    if not ref:
+        return {"cer": 0.0, "wer": 0.0, "char_accuracy": 1.0, "word_accuracy": 1.0}
+
+    char_dist = _levenshtein_distance(list(hyp), list(ref))
+    cer = round(char_dist / max(1, len(ref)), 4)
+
+    hyp_words = hyp.split() if hyp else []
+    ref_words = ref.split()
+    word_dist = _levenshtein_distance(hyp_words, ref_words)
+    wer = round(word_dist / max(1, len(ref_words)), 4)
+
+    return {
+        "cer": cer,
+        "wer": wer,
+        "char_accuracy": round(max(0.0, 1.0 - cer), 4),
+        "word_accuracy": round(max(0.0, 1.0 - wer), 4),
+    }
 
 
 def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]:
-    """Run inside the Celery worker to execute an OCR execution smoke test and measure Tamil/English transcript accuracy."""
+    """
+    Run inside the Celery worker to execute a synthetic OCR execution smoke test
+    and evaluate CER/WER via Levenshtein edit distance against reference transcripts.
+    """
     global _cached_worker_ocr_probe
     if _cached_worker_ocr_probe is None or force_reprobe:
         import tempfile
@@ -503,8 +561,8 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
         smoke_sample = ""
         extracted_tamil_line = ""
         extracted_english_line = ""
-        tamil_accuracy = 0.0
-        english_accuracy = 0.0
+        tamil_metrics = {"cer": 1.0, "wer": 1.0, "char_accuracy": 0.0, "word_accuracy": 0.0}
+        english_metrics = {"cer": 1.0, "wer": 1.0, "char_accuracy": 0.0, "word_accuracy": 0.0}
         smoke_passed = False
 
         if ocr_info.get("available") and "eng" in langs:
@@ -555,11 +613,11 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
                     extracted_english_line = "".join(
                         ch for ch in full_text if ch.isascii() and (ch.isalnum() or ch.isspace())
                     ).strip()
-                    tamil_accuracy = _normalized_similarity(extracted_tamil_line, expected_tamil)
-                    english_accuracy = _normalized_similarity(extracted_english_line, expected_english)
+                    tamil_metrics = compute_cer_and_wer(extracted_tamil_line, expected_tamil)
+                    english_metrics = compute_cer_and_wer(extracted_english_line, expected_english)
                     smoke_passed = bool(
-                        english_accuracy >= 0.85
-                        and (tamil_accuracy >= 0.85 or tamil_font is None or "tam" not in langs)
+                        english_metrics["cer"] <= 0.15
+                        and (tamil_metrics["cer"] <= 0.15 or tamil_font is None or "tam" not in langs)
                     )
             except Exception as exc:
                 smoke_sample = f"error: {exc}"
@@ -567,17 +625,22 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
 
         registered = sorted(t for t in celery_app.tasks.keys() if t.startswith("app.tasks."))
         _cached_worker_ocr_probe = {
-            "verification_type": "ocr_execution_smoke_test",
+            "verification_type": "synthetic_ocr_execution_smoke_test",
+            "is_synthetic_smoke_test": True,
             "available": bool(ocr_info.get("available") and "tam" in langs and "eng" in langs and smoke_passed),
             "tesseract_available": bool(ocr_info.get("available")),
             "languages": langs,
             "smoke_test_passed": smoke_passed,
             "reference_tamil": expected_tamil,
             "extracted_tamil": extracted_tamil_line,
-            "tamil_accuracy": tamil_accuracy,
+            "tamil_cer": tamil_metrics["cer"],
+            "tamil_wer": tamil_metrics["wer"],
+            "tamil_char_accuracy": tamil_metrics["char_accuracy"],
             "reference_english": expected_english,
             "extracted_english": extracted_english_line,
-            "english_accuracy": english_accuracy,
+            "english_cer": english_metrics["cer"],
+            "english_wer": english_metrics["wer"],
+            "english_char_accuracy": english_metrics["char_accuracy"],
             "smoke_sample": smoke_sample,
             "registered_tasks": registered,
         }

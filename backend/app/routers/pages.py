@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -98,6 +98,7 @@ def get_job_pages(
 def get_page_image(
     job_id: str,
     page_number: int,
+    request: Request,
     kind: str = Query(default="preview", pattern="^(preview|thumbnail)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -113,8 +114,24 @@ def get_page_image(
     key = page.preview_key if kind == "preview" else page.thumbnail_key
     if not key:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No visual preview available for this page")
-    path = storage.get_local_file(key)
-    return FileResponse(path, media_type="image/png")
+    try:
+        stream_info = storage.open_download_stream(
+            key=key,
+            filename=Path(key).name,
+            media_type="image/png",
+            range_header=request.headers.get("range"),
+            disposition="inline",
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page image not found in storage") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail=str(exc)) from exc
+    return StreamingResponse(
+        stream_info["iterator"],
+        status_code=stream_info["status_code"],
+        media_type=stream_info["media_type"],
+        headers=stream_info["headers"],
+    )
 
 
 @router.put("/{job_id}/pages/{page_number}")

@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import ExportArtifact, Job, User
+from app.services.retention import cleanup_expired_resources
 from app.storage import storage
 
 router = APIRouter(tags=["Exports & Downloads"])
@@ -52,6 +53,7 @@ def create_export(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    cleanup_expired_resources(db)
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == current_user.id).first()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -172,6 +174,7 @@ def create_batch_zip(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    cleanup_expired_resources(db)
     if not payload.job_ids:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No job IDs provided")
     jobs = (
@@ -193,6 +196,7 @@ def create_batch_zip(
         savings_percent=0.0,
         warnings_json=[],
         status="processing",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=current_user.retention_days),
     )
     db.add(art)
     db.commit()
@@ -220,24 +224,49 @@ def create_batch_zip(
 
 
 @router.get("/downloads/{token}")
-def download_authorized_file(token: str, db: Session = Depends(get_db)):
+def download_authorized_file(token: str, request: Request, db: Session = Depends(get_db)):
     payload = verify_download_token(token)
     user_id = payload.get("sub")
     rtype = payload.get("rtype")
     rid = payload.get("rid")
 
+    storage_key: str | None = None
+    filename: str | None = None
+
     if rtype == "original":
         job = db.query(Job).filter(Job.id == rid, Job.user_id == user_id).first()
         if not job:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Original file not found")
-        path = storage.get_local_file(job.original_storage_key)
-        return FileResponse(path, filename=job.original_filename)
-
-    if rtype == "export":
+        storage_key = job.original_storage_key
+        filename = job.original_filename
+    elif rtype == "export":
         art = db.query(ExportArtifact).filter(ExportArtifact.id == rid, ExportArtifact.user_id == user_id).first()
         if not art:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export file not found")
-        path = storage.get_local_file(art.storage_key)
-        return FileResponse(path, filename=Path(art.storage_key).name)
+        storage_key = art.storage_key
+        filename = Path(art.storage_key).name
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid download resource")
 
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid download resource")
+    if not storage_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found in storage")
+
+    try:
+        stream_info = storage.open_download_stream(
+            key=storage_key,
+            filename=filename,
+            media_type="application/octet-stream",
+            range_header=request.headers.get("range"),
+            disposition="attachment",
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found in storage") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        stream_info["iterator"],
+        status_code=stream_info["status_code"],
+        media_type=stream_info["media_type"],
+        headers=stream_info["headers"],
+    )

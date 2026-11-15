@@ -11,6 +11,7 @@ from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import Job, UploadSession, User
 from app.security import detect_format_by_signature, sanitize_filename
+from app.services.retention import StorageQuotaExceededError, enforce_storage_budget_and_quota
 from app.storage import storage
 
 router = APIRouter(prefix="/uploads", tags=["Uploads"])
@@ -54,24 +55,20 @@ def init_upload(
             detail=f"File size ({payload.expected_size_bytes:,} bytes) exceeds the maximum allowed limit of {settings.MAX_UPLOAD_BYTES:,} bytes (500 MB).",
         )
 
-    # Check user storage quota
-    used_bytes = (
-        db.query(func.coalesce(func.sum(Job.file_size_bytes), 0))
-        .filter(Job.user_id == current_user.id)
-        .scalar()
-        or 0
-    )
-    if used_bytes + payload.expected_size_bytes > current_user.storage_quota_bytes:
+    # Enforce per-user storage quota and total account storage budget (after retention cleanup)
+    try:
+        enforce_storage_budget_and_quota(db, current_user, payload.expected_size_bytes)
+    except StorageQuotaExceededError as exc:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="User storage quota exceeded. Please delete older jobs before uploading.",
-        )
+            detail=str(exc),
+        ) from exc
 
     safe_name = sanitize_filename(payload.filename)
-    is_s3 = storage.is_s3()
+    is_direct = storage.is_direct_multipart()
     effective_chunk_size = (
         max(settings.S3_MULTIPART_PART_BYTES, payload.chunk_size_bytes)
-        if is_s3
+        if is_direct
         else payload.chunk_size_bytes
     )
     total_chunks = max(1, math.ceil(payload.expected_size_bytes / effective_chunk_size))
@@ -90,11 +87,11 @@ def init_upload(
     db.flush()
 
     upload_mode = "proxy"
-    if is_s3:
+    if is_direct:
         dest_key = f"uploads/{current_user.id}/{session.id}/{safe_name}"
         session.storage_key = dest_key
         session.s3_upload_id = storage.create_multipart_upload(dest_key)
-        upload_mode = "direct_s3"
+        upload_mode = storage.direct_upload_mode()
 
     db.commit()
     db.refresh(session)
@@ -129,12 +126,20 @@ def get_direct_part_upload_url(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
     if chunk_index < 0 or chunk_index >= session.total_chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
-    if not session.s3_upload_id or not session.storage_key or not storage.is_s3():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Direct S3 upload is not enabled for this session")
+    if not session.s3_upload_id or not session.storage_key or not storage.is_direct_multipart():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Direct multipart upload is not enabled for this session",
+        )
 
     part_number = chunk_index + 1
-    url = storage.presign_upload_part(session.storage_key, session.s3_upload_id, part_number, expires_in=900)
-    return {"upload_url": url, "part_number": part_number, "expires_in_seconds": 900}
+    return storage.get_direct_part_upload_target(
+        key=session.storage_key,
+        upload_id=session.s3_upload_id,
+        part_number=part_number,
+        max_size_bytes=min(int(session.expected_size_bytes), int(settings.MAX_UPLOAD_BYTES)),
+        expires_in=900,
+    )
 
 
 @router.post("/{session_id}/parts/{chunk_index}", response_model=UploadSessionResponse)
@@ -174,7 +179,7 @@ def register_direct_s3_part(
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks,
         status=session.status,
-        upload_mode="direct_s3",
+        upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
     )
 
 
@@ -266,7 +271,7 @@ def get_upload_status(
         status=session.status,
         format_type=session.format_type,
         sha256_hash=session.sha256_hash,
-        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
+        upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
     )
 
 
@@ -295,7 +300,7 @@ def pause_upload(
         total_chunks=session.total_chunks,
         received_chunks=session.received_chunks or [],
         status=session.status,
-        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
+        upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
     )
 
 
@@ -326,7 +331,7 @@ def complete_upload(
             status=session.status,
             format_type=session.format_type,
             sha256_hash=session.sha256_hash,
-            upload_mode="direct_s3" if session.s3_upload_id else "proxy",
+            upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
         )
 
     received = set(session.received_chunks or [])
@@ -374,7 +379,7 @@ def complete_upload(
         status=session.status,
         format_type=session.format_type,
         sha256_hash=session.sha256_hash,
-        upload_mode="direct_s3" if session.s3_upload_id else "proxy",
+        upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
     )
 
 
