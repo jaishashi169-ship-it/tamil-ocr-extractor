@@ -201,23 +201,41 @@ def authorize_blob_upload(
     """
     Verify an upload session and its atomic StorageReservation for the Next.js
     `@vercel/blob/client` `handleUpload` server route (`onBeforeGenerateToken`).
+    Enforces single-use token exchange and `allow_overwrite=False` so a finalized
+    or uploaded original can never be overwritten via token replay.
     """
     claims = verify_upload_authorization_token(payload.upload_authorization_token)
     if claims.get("sid") != session_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session ID mismatch")
 
-    session = (
-        db.query(UploadSession)
-        .filter(UploadSession.id == session_id, UploadSession.user_id == claims.get("sub"))
-        .first()
+    q = db.query(UploadSession).filter(
+        UploadSession.id == session_id,
+        UploadSession.user_id == claims.get("sub"),
     )
-    if not session or session.status not in {"uploading", "paused"}:
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect == "postgresql":
+        q = q.with_for_update()
+    session = q.first()
+
+    if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active upload session not found")
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload session is already finalized or inactive; token replay is rejected.",
+        )
 
     clean_pathname = payload.pathname.lstrip("/")
     expected_key = (session.storage_key or "").lstrip("/")
     if not expected_key or clean_pathname != expected_key:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload pathname does not match reserved storage key")
+
+    existing_markers = list(session.s3_parts_json or [])
+    if any(isinstance(p, dict) and p.get("blob_token_issued") for p in existing_markers):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload token has already been issued for this session; token replay is rejected.",
+        )
 
     active_res = (
         db.query(StorageReservation)
@@ -234,11 +252,17 @@ def authorize_blob_upload(
             detail="Storage reservation is no longer active for this upload session",
         )
 
+    existing_markers.append({"PartNumber": 1, "ETag": "vercel-blob-token-issued", "blob_token_issued": True})
+    session.s3_parts_json = existing_markers
+    session.received_chunks = sorted(set(list(session.received_chunks or []) + [0]))
+    db.commit()
+
     return {
         "upload_id": session.id,
         "user_id": session.user_id,
         "storage_key": expected_key,
         "expected_size_bytes": int(session.expected_size_bytes),
+        "allow_overwrite": False,
     }
 
 
@@ -256,8 +280,11 @@ def get_direct_part_upload_url(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
-    if session.status in {"completed", "aborted"}:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Upload session is already {session.status} and cannot be modified",
+        )
     if chunk_index < 0 or chunk_index >= session.total_chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
     if not session.s3_upload_id or not session.storage_key or not storage.is_s3():
@@ -291,8 +318,11 @@ def register_direct_s3_part(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
-    if session.status in {"completed", "aborted"}:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Upload session is already {session.status} and cannot be modified",
+        )
     if chunk_index < 0 or chunk_index >= session.total_chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
 
@@ -333,8 +363,11 @@ async def upload_chunk(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
-    if session.status in {"completed", "aborted"}:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Upload session is already {session.status}")
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Upload session is already {session.status} and cannot be modified",
+        )
     if chunk_index < 0 or chunk_index >= session.total_chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid chunk index")
 
@@ -418,7 +451,12 @@ def get_upload_status(
                 storage_key=session.storage_key or "",
                 expected_size_bytes=session.expected_size_bytes,
             )
-            if mode == "vercel_blob" and session.status in {"uploading", "paused"}
+            if (
+                mode == "vercel_blob"
+                and session.status in {"uploading", "paused"}
+                and not session.sha256_hash
+                and not any(isinstance(p, dict) and p.get("blob_token_issued") for p in (session.s3_parts_json or []))
+            )
             else None
         ),
     )
@@ -437,6 +475,11 @@ def pause_upload(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Upload session is already {session.status} and cannot be paused or modified",
+        )
     if session.status == "uploading":
         session.status = "paused"
         db.commit()
@@ -464,28 +507,22 @@ def complete_upload(
 ):
     _enforce_upload_readiness_and_smoke_gate(current_user, x_smoke_test_token)
 
-    session = (
-        db.query(UploadSession)
-        .filter(UploadSession.id == session_id, UploadSession.user_id == current_user.id)
-        .first()
+    q = db.query(UploadSession).filter(
+        UploadSession.id == session_id,
+        UploadSession.user_id == current_user.id,
     )
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect == "postgresql":
+        q = q.with_for_update()
+    session = q.first()
+
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
 
-    if session.status == "completed":
-        return UploadSessionResponse(
-            session_id=session.id,
-            filename=session.filename,
-            expected_size_bytes=session.expected_size_bytes,
-            received_bytes=session.expected_size_bytes,
-            chunk_size_bytes=session.chunk_size_bytes,
-            total_chunks=session.total_chunks,
-            received_chunks=session.received_chunks or [],
-            status=session.status,
-            format_type=session.format_type,
-            sha256_hash=session.sha256_hash,
-            upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
-            storage_key=session.storage_key,
+    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload session has already been accepted or finalized; re-finalization or replacement is rejected.",
         )
 
     is_blob_sdk_upload = session.s3_upload_id == "vercel-blob-sdk-managed"
@@ -558,10 +595,15 @@ def abort_upload(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+    if session.status in {"processing", "completed"} or session.sha256_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Finalized or processing upload session cannot be aborted or replaced.",
+        )
     storage.abort_chunks(session.id)
-    if session.s3_upload_id and session.storage_key and session.status != "completed":
+    if session.s3_upload_id and session.storage_key:
         storage.abort_multipart_upload(session.storage_key, session.s3_upload_id)
-    if session.storage_key and session.status != "completed":
+    if session.storage_key:
         storage.delete_key(session.storage_key)
     release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
     session.status = "aborted"

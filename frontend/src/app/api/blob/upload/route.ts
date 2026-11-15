@@ -54,7 +54,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         return {
           maximumSizeInBytes: Number(verified.expected_size_bytes),
           addRandomSuffix: false,
-          allowOverwrite: true,
+          allowOverwrite: false,
           tokenPayload: JSON.stringify({
             session_id: verified.upload_id,
             storage_key: verified.storage_key,

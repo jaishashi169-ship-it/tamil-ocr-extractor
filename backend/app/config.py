@@ -95,6 +95,12 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "APP_ENV=production requires managed PostgreSQL; SQLite or /tmp database fallback is not permitted."
                 )
+            for secret_name in ("CRON_SECRET", "SMOKE_TEST_SECRET"):
+                secret_val = (getattr(self, secret_name) or "").strip()
+                if secret_val and (secret_val == self.SECRET_KEY.strip() or len(secret_val) < 32):
+                    raise ValueError(
+                        f"APP_ENV=production requires {secret_name} to be a dedicated secret (>= 32 characters) distinct from SECRET_KEY."
+                    )
             backend = self.STORAGE_BACKEND.lower()
             if backend not in {"s3", "vercel_blob"}:
                 raise ValueError(

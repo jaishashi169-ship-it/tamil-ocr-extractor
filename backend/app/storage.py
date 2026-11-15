@@ -600,6 +600,8 @@ class PrivateStorage:
 
     def assemble_chunks(self, session_id: str, total_chunks: int, dest_key: str) -> tuple[int, str]:
         dest_path = self.local_path_for(dest_key)
+        if dest_path.exists():
+            raise FileExistsError(f"Finalized original already exists and cannot be overwritten: {dest_key}")
         tmp_path = dest_path.with_suffix(dest_path.suffix + ".assembling")
         sha256 = hashlib.sha256()
         total_bytes = 0
@@ -628,7 +630,7 @@ class PrivateStorage:
         if self.backend == "s3" and self._s3 is not None:
             self._s3.upload_file(str(dest_path), settings.S3_BUCKET_NAME, dest_key)
         elif self.is_vercel_blob():
-            self.save_file(dest_key, dest_path)
+            self.save_file(dest_key, dest_path, allow_overwrite=False)
 
         return total_bytes, sha256.hexdigest()
 
@@ -637,8 +639,16 @@ class PrivateStorage:
             chunk_dir = self.local_path_for(f"chunks/{session_id}")
             shutil.rmtree(chunk_dir, ignore_errors=True)
 
-    def save_bytes(self, key: str, data: bytes) -> str:
+    def save_bytes(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+        allow_overwrite: bool = False,
+    ) -> str:
         clean_key = key.lstrip("/")
+        effective_overwrite = False if clean_key.startswith("uploads/") else bool(allow_overwrite)
         write_hook = _write_hook_var.get()
         if write_hook is not None:
             write_hook(clean_key, len(data))
@@ -648,22 +658,30 @@ class PrivateStorage:
                 clean_key,
                 data,
                 access="private",
-                content_type="application/octet-stream",
+                content_type=content_type,
                 add_random_suffix=False,
-                allow_overwrite=True,
+                allow_overwrite=effective_overwrite,
             )
             return clean_key
 
         if self.backend == "s3" and self._s3 is not None:
-            self._s3.put_object(Bucket=settings.S3_BUCKET_NAME, Key=clean_key, Body=data)
+            self._s3.put_object(
+                Bucket=settings.S3_BUCKET_NAME,
+                Key=clean_key,
+                Body=data,
+                ContentType=content_type,
+            )
             return clean_key
 
         path = self.local_path_for(clean_key)
+        if path.exists() and not effective_overwrite and clean_key.startswith("uploads/"):
+            raise FileExistsError(f"Original upload object already exists and cannot be overwritten: {clean_key}")
         path.write_bytes(data)
         return clean_key
 
-    def save_file(self, key: str, src_path: Path) -> str:
+    def save_file(self, key: str, src_path: Path, *, allow_overwrite: bool = False) -> str:
         clean_key = key.lstrip("/")
+        effective_overwrite = False if clean_key.startswith("uploads/") else bool(allow_overwrite)
         file_size = src_path.stat().st_size
         if self.is_vercel_blob():
             self._sync_blob_sdk_env()
@@ -677,7 +695,7 @@ class PrivateStorage:
                     access="private",
                     content_type="application/octet-stream",
                     add_random_suffix=False,
-                    allow_overwrite=True,
+                    allow_overwrite=effective_overwrite,
                 ) as mpu:
                     with open(src_path, "rb") as f:
                         while True:
@@ -686,7 +704,7 @@ class PrivateStorage:
                                 break
                             mpu.upload_part(chunk)
                 return clean_key
-            return self.save_bytes(clean_key, src_path.read_bytes())
+            return self.save_bytes(clean_key, src_path.read_bytes(), allow_overwrite=effective_overwrite)
 
         write_hook = _write_hook_var.get()
         if write_hook is not None:

@@ -1,9 +1,13 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
-from sqlalchemy import case, func
+import threading
+from typing import Any, Dict, Iterator, Optional
+import uuid
+from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.dispatch import _redis_kwargs_for_url, is_broker_reachable
 from app.models import (
     Draft,
     ExportArtifact,
@@ -15,9 +19,74 @@ from app.models import (
 )
 from app.storage import storage
 
+RETENTION_LOCK_REDIS_KEY = "doc_studio:retention:cleanup_lock"
+RETENTION_PG_ADVISORY_LOCK_ID = 748291045
+_local_cleanup_lock = threading.Lock()
+
 
 class StorageQuotaExceededError(Exception):
     """Raised when a user's storage quota or the total account storage budget would be exceeded."""
+
+
+@contextmanager
+def _try_retention_distributed_lock(db: Session, ttl_seconds: int = 120) -> Iterator[bool]:
+    """
+    Acquire a non-blocking distributed lock across process threads, Redis (if reachable),
+    and PostgreSQL (`pg_try_advisory_xact_lock`) so overlapping retention triggers
+    (in-worker scheduler, Celery task, opportunistic check, and Vercel Cron) never collide.
+    """
+    if not _local_cleanup_lock.acquire(blocking=False):
+        yield False
+        return
+
+    redis_client = None
+    lock_token = uuid.uuid4().hex
+    try:
+        cfg = get_settings()
+        broker_url = cfg.CELERY_BROKER_URL or ""
+        if is_broker_reachable(broker_url, 0.2, 0.5):
+            try:
+                import redis
+
+                redis_client = redis.Redis.from_url(
+                    broker_url,
+                    **_redis_kwargs_for_url(broker_url, 0.2, 0.5),
+                )
+                acquired_redis = bool(
+                    redis_client.set(RETENTION_LOCK_REDIS_KEY, lock_token, nx=True, ex=ttl_seconds)
+                )
+                if not acquired_redis:
+                    redis_client = None
+                    yield False
+                    return
+            except Exception:
+                redis_client = None
+
+        dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
+        if dialect == "postgresql":
+            pg_acquired = bool(
+                db.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                    {"lock_id": RETENTION_PG_ADVISORY_LOCK_ID},
+                ).scalar()
+            )
+            if not pg_acquired:
+                yield False
+                return
+
+        yield True
+    finally:
+        if redis_client is not None:
+            try:
+                redis_client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    RETENTION_LOCK_REDIS_KEY,
+                    lock_token,
+                )
+            except Exception:
+                pass
+        _local_cleanup_lock.release()
 
 
 def _acquire_budget_lock(db: Session) -> StorageBudgetState:
@@ -53,95 +122,135 @@ def _effective_reservation_expr():
     )
 
 
-def cleanup_expired_resources(db: Session, stale_upload_hours: int = 6) -> Dict[str, int]:
+def cleanup_expired_resources(db: Session, stale_upload_hours: int = 6) -> Dict[str, Any]:
     """
-    Delete expired jobs, expired export artifacts, stale incomplete upload sessions,
+    Idempotently delete expired jobs, expired export artifacts, stale incomplete upload sessions,
     and expired/abandoned storage reservations from both private storage and the database.
+    Uses a non-blocking distributed lock across process threads, Redis, and PostgreSQL so
+    overlapping triggers (worker scheduler, Celery Beat/task, opportunistic check, and Vercel Cron)
+    never collide.
     """
-    now_utc = datetime.now(timezone.utc)
-    stale_cutoff = now_utc - timedelta(hours=stale_upload_hours)
+    with _try_retention_distributed_lock(db) as acquired:
+        if not acquired:
+            return {
+                "skipped_locked": True,
+                "deleted_jobs": 0,
+                "deleted_exports": 0,
+                "cleaned_upload_sessions": 0,
+                "released_reservations": 0,
+            }
 
-    deleted_exports = 0
-    deleted_jobs = 0
-    cleaned_uploads = 0
-    released_reservations = 0
+        now_utc = datetime.now(timezone.utc)
+        stale_cutoff = now_utc - timedelta(hours=stale_upload_hours)
+        dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
 
-    # 1. Expired standalone export artifacts
-    expired_arts = (
-        db.query(ExportArtifact)
-        .filter(ExportArtifact.expires_at.isnot(None), ExportArtifact.expires_at < now_utc)
-        .all()
-    )
-    for art in expired_arts:
-        if art.storage_key:
-            storage.delete_key(art.storage_key)
-        released_reservations += release_reservations_for_resource(
-            db, resource_type="export", resource_id=art.id, commit=False
+        deleted_exports = 0
+        deleted_jobs = 0
+        cleaned_uploads = 0
+        released_reservations = 0
+
+        # 1. Expired standalone export artifacts
+        exp_arts_q = db.query(ExportArtifact).filter(
+            ExportArtifact.expires_at.isnot(None),
+            ExportArtifact.expires_at < now_utc,
         )
-        db.delete(art)
-        deleted_exports += 1
+        if dialect == "postgresql":
+            exp_arts_q = exp_arts_q.with_for_update(skip_locked=True)
+        expired_arts = exp_arts_q.all()
+        for art in expired_arts:
+            if art.storage_key:
+                storage.delete_key(art.storage_key)
+            released_reservations += release_reservations_for_resource(
+                db, resource_type="export", resource_id=art.id, commit=False
+            )
+            deleted = (
+                db.query(ExportArtifact)
+                .filter(ExportArtifact.id == art.id)
+                .delete(synchronize_session=False)
+            )
+            if deleted:
+                deleted_exports += 1
 
-    # 2. Expired jobs (cascades PageResult, ExportArtifact, StudyProject, Draft)
-    expired_jobs = (
-        db.query(Job)
-        .filter(Job.expires_at.isnot(None), Job.expires_at < now_utc)
-        .all()
-    )
-    for job in expired_jobs:
-        release_all_job_storage_and_reservations(db, job, delete_original=True, commit=False)
-        db.query(Draft).filter(Draft.job_id == job.id).delete(synchronize_session=False)
-        db.delete(job)
-        deleted_jobs += 1
+        # 2. Expired jobs (cascades PageResult, ExportArtifact, StudyProject, Draft)
+        exp_jobs_q = db.query(Job).filter(
+            Job.expires_at.isnot(None),
+            Job.expires_at < now_utc,
+        )
+        if dialect == "postgresql":
+            exp_jobs_q = exp_jobs_q.with_for_update(skip_locked=True)
+        expired_jobs = exp_jobs_q.all()
+        for job in expired_jobs:
+            release_all_job_storage_and_reservations(db, job, delete_original=True, commit=False)
+            db.query(Draft).filter(Draft.job_id == job.id).delete(synchronize_session=False)
+            db.delete(job)
+            deleted_jobs += 1
 
-    # 3. Stale incomplete or failed/aborted upload sessions
-    stale_sessions = (
-        db.query(UploadSession)
-        .filter(
+        # 3. Stale incomplete or failed/aborted upload sessions
+        stale_q = db.query(UploadSession).filter(
             UploadSession.status.in_(["uploading", "paused", "failed", "aborted"]),
             UploadSession.updated_at < stale_cutoff,
         )
-        .all()
-    )
-    for sess in stale_sessions:
-        storage.abort_chunks(sess.id)
-        if sess.s3_upload_id and sess.storage_key and sess.status != "completed":
-            storage.abort_multipart_upload(sess.storage_key, sess.s3_upload_id)
-        if sess.storage_key and sess.status != "completed":
-            storage.delete_key(sess.storage_key)
-        released_reservations += release_reservations_for_resource(
-            db, resource_type="upload", resource_id=sess.id, commit=False
-        )
-        db.delete(sess)
-        cleaned_uploads += 1
+        if dialect == "postgresql":
+            stale_q = stale_q.with_for_update(skip_locked=True)
+        stale_sessions = stale_q.all()
+        for sess in stale_sessions:
+            storage.abort_chunks(sess.id)
+            if sess.s3_upload_id and sess.storage_key and sess.status != "completed":
+                storage.abort_multipart_upload(sess.storage_key, sess.s3_upload_id)
+            if sess.storage_key and sess.status != "completed":
+                storage.delete_key(sess.storage_key)
+            released_reservations += release_reservations_for_resource(
+                db, resource_type="upload", resource_id=sess.id, commit=False
+            )
+            deleted_s = (
+                db.query(UploadSession)
+                .filter(UploadSession.id == sess.id, UploadSession.status != "completed")
+                .delete(synchronize_session=False)
+            )
+            if deleted_s:
+                cleaned_uploads += 1
 
-    # 4. Expired active reservations (abandoned uploads, crashed temp objects, expired outputs)
-    expired_res = (
-        db.query(StorageReservation)
-        .filter(
+        # 4. Expired active reservations (abandoned uploads, crashed temp objects, expired outputs)
+        exp_res_q = db.query(StorageReservation).filter(
             StorageReservation.status.in_(["reserved", "committed"]),
             StorageReservation.expires_at.isnot(None),
             StorageReservation.expires_at < now_utc,
         )
-        .all()
-    )
-    for res in expired_res:
-        if res.storage_key and res.resource_type in {"upload", "temp_object", "export", "preview"}:
-            storage.delete_key(res.storage_key)
-        res.status = "expired"
-        res.reserved_bytes = 0
-        res.actual_bytes = 0
-        res.updated_at = now_utc
-        released_reservations += 1
+        if dialect == "postgresql":
+            exp_res_q = exp_res_q.with_for_update(skip_locked=True)
+        expired_res = exp_res_q.all()
+        for res in expired_res:
+            claimed = (
+                db.query(StorageReservation)
+                .filter(
+                    StorageReservation.id == res.id,
+                    StorageReservation.status.in_(["reserved", "committed"]),
+                )
+                .update(
+                    {
+                        StorageReservation.status: "expired",
+                        StorageReservation.reserved_bytes: 0,
+                        StorageReservation.actual_bytes: 0,
+                        StorageReservation.updated_at: now_utc,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if claimed:
+                if res.storage_key and res.resource_type in {"upload", "temp_object", "export", "preview"}:
+                    storage.delete_key(res.storage_key)
+                released_reservations += 1
 
-    if deleted_exports or deleted_jobs or cleaned_uploads or released_reservations:
-        db.commit()
+        if deleted_exports or deleted_jobs or cleaned_uploads or released_reservations:
+            db.commit()
 
-    return {
-        "deleted_jobs": deleted_jobs,
-        "deleted_exports": deleted_exports,
-        "cleaned_upload_sessions": cleaned_uploads,
-        "released_reservations": released_reservations,
-    }
+        return {
+            "skipped_locked": False,
+            "deleted_jobs": deleted_jobs,
+            "deleted_exports": deleted_exports,
+            "cleaned_upload_sessions": cleaned_uploads,
+            "released_reservations": released_reservations,
+        }
 
 
 def get_storage_budget_snapshot(db: Session, user: Optional[User] = None) -> Dict[str, Any]:

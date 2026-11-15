@@ -120,6 +120,19 @@ def process_extraction_job_sync(
         original_key_for_scratch_cleanup = job.original_storage_key
         file_path = storage.get_local_file(job.original_storage_key)
 
+        if job.file_sha256:
+            import hashlib
+
+            h = hashlib.sha256()
+            with open(file_path, "rb") as _vf:
+                while True:
+                    _b = _vf.read(1024 * 1024)
+                    if not _b:
+                        break
+                    h.update(_b)
+            if h.hexdigest() != job.file_sha256:
+                raise CorruptFileError("Original file integrity check (SHA-256) failed; file may have been modified.")
+
         def _on_progress(current_page: int, total_pages: int, label: str) -> None:
             hb_now = datetime.now(timezone.utc)
             new_lease = hb_now + timedelta(seconds=settings.JOB_LEASE_SECONDS)
@@ -349,8 +362,12 @@ def finalize_upload_sync(session_id: str) -> None:
     db = SessionLocal()
     original_key_for_scratch_cleanup: Optional[str] = None
     try:
-        session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
-        if not session or session.status in {"completed", "aborted"}:
+        q = db.query(UploadSession).filter(UploadSession.id == session_id)
+        dialect = db.bind.dialect.name if db.bind is not None else ""
+        if dialect == "postgresql":
+            q = q.with_for_update()
+        session = q.first()
+        if not session or session.status in {"completed", "aborted", "failed"} or session.sha256_hash:
             return
 
         if session.s3_upload_id and session.storage_key and storage.is_direct_multipart():
@@ -422,16 +439,33 @@ def finalize_upload_sync(session_id: str) -> None:
             db.commit()
             return
 
-        session.storage_key = dest_key
-        session.sha256_hash = sha256_hex
-        session.format_type = fmt
-        session.expected_size_bytes = actual_bytes
-        session.status = "completed"
+        finalized_rows = (
+            db.query(UploadSession)
+            .filter(
+                UploadSession.id == session.id,
+                UploadSession.sha256_hash.is_(None),
+                UploadSession.status.in_(["uploading", "processing"]),
+            )
+            .update(
+                {
+                    UploadSession.storage_key: dest_key,
+                    UploadSession.sha256_hash: sha256_hex,
+                    UploadSession.format_type: fmt,
+                    UploadSession.expected_size_bytes: actual_bytes,
+                    UploadSession.status: "completed",
+                },
+                synchronize_session=False,
+            )
+        )
+        if finalized_rows == 0:
+            db.rollback()
+            return
         db.commit()
     except Exception:
         db.rollback()
         session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
-        if session and session.status == "processing":
+        # Never delete an original that another finalizer already accepted (sha256 recorded).
+        if session and session.status == "processing" and not session.sha256_hash:
             if session.storage_key:
                 storage.delete_key(session.storage_key)
             release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)

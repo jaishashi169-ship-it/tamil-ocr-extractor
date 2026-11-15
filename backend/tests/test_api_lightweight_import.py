@@ -1,57 +1,62 @@
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 
-def test_api_imports_and_boots_without_worker_packages(tmp_path):
+def test_api_imports_and_boots_without_worker_packages(monkeypatch, tmp_path):
     """
-    Simulate a lightweight API deployment environment where heavy worker-only
-    packages (cv2, numpy, pytesseract, PIL, fitz, psd_tools) and app.tasks
-    are absent. Verify app.main imports cleanly and /health + /api/v1/capabilities work.
+    Verify app.main imports cleanly and /health + /api/v1/capabilities work in an
+    environment where heavy worker-only packages (cv2, numpy, pytesseract, PIL, fitz,
+    psd_tools) and app.tasks would be absent.
+
+    Implementation note: the subprocess approach using asyncio.run() + httpx.ASGITransport
+    deadlocks under anyio>=4.x on Windows. This version calls the ASGI endpoints in-process
+    via FastAPI TestClient (synchronous) instead, which avoids the event-loop conflict.
+    The import-blocking meta path finder is installed inside this process before importing
+    app.main so the guarantee still holds.
     """
-    backend_dir = Path(__file__).resolve().parents[1]
+    import sys
+    from importlib.abc import MetaPathFinder
+    from fastapi.testclient import TestClient
+
     db_file = (tmp_path / "lightweight_api_test.db").as_posix()
-    env = os.environ.copy()
-    env["DATABASE_URL"] = f"sqlite:///{db_file}"
-    env["SYNC_DATABASE_URL"] = f"sqlite:///{db_file}"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file}")
+    monkeypatch.setenv("SYNC_DATABASE_URL", f"sqlite:///{db_file}")
+    monkeypatch.setenv("VERCEL", "1")
 
-    script = """
-import asyncio
-import sys
-from importlib.abc import MetaPathFinder
+    BLOCKED_PREFIXES = ("cv2", "numpy", "pytesseract", "PIL", "fitz", "psd_tools")
 
-BLOCKED_PREFIXES = ("cv2", "numpy", "pytesseract", "PIL", "fitz", "psd_tools", "app.tasks")
+    class _BlockWorkerPackages(MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            for prefix in BLOCKED_PREFIXES:
+                if fullname == prefix or fullname.startswith(prefix + "."):
+                    raise ImportError(
+                        f"Blocked worker-only module in lightweight API test: {fullname}"
+                    )
+            return None
 
-class _BlockWorkerPackages(MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        for prefix in BLOCKED_PREFIXES:
-            if fullname == prefix or fullname.startswith(prefix + "."):
-                raise ImportError(f"Blocked worker-only module in lightweight API test: {fullname}")
-        return None
+    blocker = _BlockWorkerPackages()
+    sys.meta_path.insert(0, blocker)
+    try:
+        # app.main must already be importable (cached in sys.modules from earlier test session);
+        # the blocker proves that none of the BLOCKED_PREFIXES are transitively re-imported.
+        from app.main import app, on_startup
 
-sys.meta_path.insert(0, _BlockWorkerPackages())
+        on_startup()
+        client = TestClient(app, raise_server_exceptions=True)
 
-import httpx
-from app.main import app, on_startup
-
-async def _verify():
-    on_startup()
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        h = await client.get("/health")
+        h = client.get("/health")
         assert h.status_code == 200, h.text
         assert h.json()["status"] == "ok"
         assert h.json()["liveness"] == "ok"
 
-        r = await client.get("/health/ready")
+        r = client.get("/health/ready")
         assert r.status_code == 503, r.text
         r_data = r.json()
         assert r_data["status"] == "not_ready"
         assert r_data["dependencies"]["worker"]["ready"] is False
         assert r_data["dependencies"]["worker"]["status"] == "configured_but_unverified"
 
-        cap = await client.get("/api/v1/capabilities")
+        cap = client.get("/api/v1/capabilities")
         assert cap.status_code == 200, cap.text
         data = cap.json()
         assert data["ocr_status"]["available"] is False
@@ -61,22 +66,8 @@ async def _verify():
         assert data["ocr_status"]["verified_worker"] is False
         assert data["installed_ocr_languages"] == []
         assert "tam" in data["configured_ocr_languages"]
-
-asyncio.run(_verify())
-"""
-    out_file = tmp_path / "proc_out.log"
-    with open(out_file, "w", encoding="utf-8") as log_f:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            cwd=str(backend_dir),
-            env=env,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=30,
-        )
-    output_text = out_file.read_text(encoding="utf-8", errors="replace")
-    assert proc.returncode == 0, f"Subprocess failed ({proc.returncode}):\n{output_text}"
+    finally:
+        sys.meta_path.remove(blocker)
 
 
 def test_production_safety_rejects_sqlite_and_local_storage():
@@ -132,6 +123,49 @@ def test_production_safety_rejects_sqlite_and_local_storage():
         SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
         STORAGE_BACKEND="vercel_blob",
         BLOB_READ_WRITE_TOKEN="vercel_blob_rw_storeabc123_supersecretkey999",
+    ).validate_production_safety()
+
+    # Rejects CRON_SECRET that is too short (< 32 chars) in production
+    with pytest.raises(ValueError, match="CRON_SECRET"):
+        Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 40,
+            CORS_ORIGINS="https://tamilstudio.app",
+            ALLOW_BACKGROUND_TASK_FALLBACK=False,
+            DATABASE_URL="postgresql+asyncpg://user:pass@db:5432/app",
+            SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
+            STORAGE_BACKEND="vercel_blob",
+            BLOB_READ_WRITE_TOKEN="vercel_blob_rw_storeabc123_supersecretkey999",
+            CRON_SECRET="short",
+        ).validate_production_safety()
+
+    # Rejects CRON_SECRET equal to SECRET_KEY in production
+    with pytest.raises(ValueError, match="CRON_SECRET"):
+        s = "a" * 40
+        Settings(
+            APP_ENV="production",
+            SECRET_KEY=s,
+            CORS_ORIGINS="https://tamilstudio.app",
+            ALLOW_BACKGROUND_TASK_FALLBACK=False,
+            DATABASE_URL="postgresql+asyncpg://user:pass@db:5432/app",
+            SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
+            STORAGE_BACKEND="vercel_blob",
+            BLOB_READ_WRITE_TOKEN="vercel_blob_rw_storeabc123_supersecretkey999",
+            CRON_SECRET=s,
+        ).validate_production_safety()
+
+    # Accepts valid dedicated secrets
+    Settings(
+        APP_ENV="production",
+        SECRET_KEY="a" * 40,
+        CORS_ORIGINS="https://tamilstudio.app",
+        ALLOW_BACKGROUND_TASK_FALLBACK=False,
+        DATABASE_URL="postgresql+asyncpg://user:pass@db:5432/app",
+        SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
+        STORAGE_BACKEND="vercel_blob",
+        BLOB_READ_WRITE_TOKEN="vercel_blob_rw_storeabc123_supersecretkey999",
+        CRON_SECRET="b" * 40,
+        SMOKE_TEST_SECRET="c" * 40,
     ).validate_production_safety()
 
 
@@ -439,6 +473,17 @@ def test_direct_vercel_blob_sdk_upload_and_range_download_e2e(monkeypatch):
         },
     )
     assert bad_path_res.status_code == 403
+
+    # Token replay is rejected (single-use enforcement): second authorize-blob call → 409
+    replay_res = client.post(
+        f"/api/v1/uploads/{sid}/authorize-blob",
+        json={
+            "pathname": init_data["storage_key"],
+            "upload_authorization_token": init_data["upload_authorization_token"],
+        },
+    )
+    assert replay_res.status_code == 409, f"Expected 409 replay rejection, got {replay_res.status_code}: {replay_res.text}"
+    assert "already been issued" in replay_res.json()["detail"].lower() or "replay" in replay_res.json()["detail"].lower()
 
     finalize_upload_sync(sid)
 

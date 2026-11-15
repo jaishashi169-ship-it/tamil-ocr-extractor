@@ -344,26 +344,32 @@ def scheduled_cron_retention_cleanup(
 ):
     """
     Platform-scheduled retention & expired-reservation cleanup endpoint (compatible with Vercel Cron).
-    Requires Authorization: Bearer <CRON_SECRET> or X-Cron-Secret header.
+    Requires Authorization: Bearer <CRON_SECRET> or X-Cron-Secret header matching dedicated CRON_SECRET.
+    Never falls back to SECRET_KEY.
     """
     cfg = get_settings()
-    expected = (cfg.CRON_SECRET or cfg.SECRET_KEY or "").strip()
+    expected = (cfg.CRON_SECRET or "").strip()
     supplied = ""
     if authorization and authorization.lower().startswith("bearer "):
         supplied = authorization[7:].strip()
     elif x_cron_secret:
         supplied = x_cron_secret.strip()
 
-    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+    if (
+        not expected
+        or expected == (cfg.SECRET_KEY or "").strip()
+        or not supplied
+        or not hmac.compare_digest(supplied, expected)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing cron authorization secret.",
+            detail="Invalid or missing dedicated CRON_SECRET authorization.",
         )
 
     summary = cleanup_expired_resources(db)
     budget = get_storage_budget_snapshot(db)
     return {
-        "status": "completed",
+        "status": "skipped_locked" if summary.get("skipped_locked") else "completed",
         "trigger": "scheduled_cron",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "cleaned": summary,
@@ -378,17 +384,22 @@ def run_restricted_production_smoke_test(
 ):
     """
     Restricted production smoke test endpoint.
-    Authorized via X-Smoke-Test-Token matching SMOKE_TEST_SECRET (or SECRET_KEY when SMOKE_TEST_SECRET is unset).
+    Authorized via X-Smoke-Test-Token matching dedicated SMOKE_TEST_SECRET (never falls back to SECRET_KEY).
     Verifies readiness, atomic storage reservation + object write/read/delete round-trip, and worker status
     while keeping public uploads blocked when RESTRICTED_SMOKE_TEST_MODE=true or REQUIRE_READINESS_FOR_UPLOADS=true.
     """
     cfg = get_settings()
-    expected = (cfg.SMOKE_TEST_SECRET or cfg.SECRET_KEY or "").strip()
+    expected = (cfg.SMOKE_TEST_SECRET or "").strip()
     supplied = (x_smoke_test_token or "").strip()
-    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+    if (
+        not expected
+        or expected == (cfg.SECRET_KEY or "").strip()
+        or not supplied
+        or not hmac.compare_digest(supplied, expected)
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Valid X-Smoke-Test-Token header is required for restricted production smoke test.",
+            detail="Valid X-Smoke-Test-Token header matching dedicated SMOKE_TEST_SECRET is required.",
         )
 
     readiness = evaluate_readiness()
