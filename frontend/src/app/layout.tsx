@@ -1,20 +1,7 @@
 import type { Metadata } from "next";
-import { Noto_Sans, Noto_Sans_Tamil } from "next/font/google";
 import "./globals.css";
 import { StudioProvider } from "@/components/StudioContext";
 import { Header } from "@/components/Header";
-
-const notoSans = Noto_Sans({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
-  variable: "--font-noto-sans",
-});
-
-const notoTamil = Noto_Sans_Tamil({
-  subsets: ["tamil"],
-  weight: ["400", "500", "600", "700"],
-  variable: "--font-noto-tamil",
-});
 
 export const metadata: Metadata = {
   title: "Tamil English Document Studio",
@@ -23,7 +10,15 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${notoSans.variable} ${notoTamil.variable}`}>
+    <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link
+          rel="stylesheet"
+          href="https://fonts.googleapis.com/css2?family=Noto+Sans+Tamil:wght@400;500;600;700&family=Noto+Sans:wght@400;500;600;700&display=swap"
+        />
+      </head>
       <body className="min-h-screen font-sans antialiased bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
         <StudioProvider>
           <Header />

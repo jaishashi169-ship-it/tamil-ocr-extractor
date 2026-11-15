@@ -6,6 +6,8 @@
   --bg-page: #f8fafc;
   --bg-card: #ffffff;
   --text-primary: #0f172a;
+  --font-noto-sans: "Noto Sans", system-ui, -apple-system, sans-serif;
+  --font-noto-tamil: "Noto Sans Tamil", "Noto Sans", sans-serif;
 }
 
 .dark {
@@ -17,6 +19,7 @@
 body {
   background-color: var(--bg-page);
   color: var(--text-primary);
+  font-family: var(--font-noto-sans), var(--font-noto-tamil), sans-serif;
   font-feature-settings: "kern" 1;
 }
 
