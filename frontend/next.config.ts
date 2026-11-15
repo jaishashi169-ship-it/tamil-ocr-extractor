@@ -12,7 +12,7 @@ const PLACEHOLDER_API_PATTERNS = [
 ];
 
 if (process.env.VERCEL === "1") {
-  const apiUrl = (process.env.NEXT_PUBLIC_API_URL?.trim() || "").replace(/\/+$/, "");
+  const apiUrl = (process.env.NEXT_PUBLIC_API_URL?.trim() || "/api/v1").replace(/\/+$/, "");
   if (!apiUrl) {
     throw new Error(
       "NEXT_PUBLIC_API_URL must be set to /api/v1 (same-origin service routing) or your HTTPS backend API URL before building on Vercel."
