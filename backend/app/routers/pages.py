@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Draft, Job, PageResult, User
-from app.services.ocr_engine import OCROptions, OCRUnavailableError, run_ocr_on_image
 from app.services.study.grammar import review_grammar_and_spelling
 from app.services.tamil_utils import (
     SUPPORTED_LEGACY_ENCODINGS,
@@ -194,6 +193,14 @@ def reprocess_page_or_region(
     crop_tuple = None
     if payload.crop_box and len(payload.crop_box) == 4:
         crop_tuple = (payload.crop_box[0], payload.crop_box[1], payload.crop_box[2], payload.crop_box[3])
+
+    try:
+        from app.services.ocr_engine import OCROptions, OCRUnavailableError, run_ocr_on_image
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OCR reprocessing requires the OCR worker environment.",
+        ) from exc
 
     opts = OCROptions(
         language=payload.language,

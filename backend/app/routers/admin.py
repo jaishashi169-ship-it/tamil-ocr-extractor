@@ -8,9 +8,35 @@ from app.auth import get_current_user, require_admin
 from app.config import get_settings
 from app.database import get_db
 from app.models import Job, SystemSetting, User
-from app.services.ocr_engine import get_installed_tesseract_languages, get_ocr_status
 from app.services.tamil_utils import SUPPORTED_LEGACY_ENCODINGS
 from app.storage import storage
+
+
+def _safe_ocr_status() -> Dict[str, Any]:
+    try:
+        from app.services.ocr_engine import get_ocr_status
+
+        status_info = get_ocr_status()
+        status_info["execution_mode"] = "local_or_worker"
+        status_info["verified_locally"] = True
+        return status_info
+    except ImportError:
+        return {
+            "available": True,
+            "execution_mode": "worker_daemon",
+            "verified_locally": False,
+            "configured_languages": ["eng", "tam"],
+            "languages": [],
+        }
+
+
+def _safe_ocr_languages() -> list[str]:
+    try:
+        from app.services.ocr_engine import get_installed_tesseract_languages
+
+        return get_installed_tesseract_languages()
+    except ImportError:
+        return []
 
 router = APIRouter(tags=["Capabilities & Administration"])
 settings = get_settings()
@@ -25,7 +51,7 @@ class UpdateQuotasRequest(BaseModel):
 @router.get("/capabilities")
 def get_capabilities():
     """Public capability matrix and installed OCR language packs."""
-    ocr = get_ocr_status()
+    ocr = _safe_ocr_status()
     return {
         "app_name": settings.APP_NAME,
         "max_upload_bytes": settings.MAX_UPLOAD_BYTES,
@@ -33,6 +59,7 @@ def get_capabilities():
         "max_batch_files": settings.MAX_BATCH_FILES,
         "max_pdf_pages": settings.MAX_PDF_PAGES,
         "installed_ocr_languages": ocr["languages"],
+        "configured_ocr_languages": ocr.get("configured_languages", ocr["languages"]),
         "ocr_status": ocr,
         "supported_legacy_tamil_encodings": SUPPORTED_LEGACY_ENCODINGS,
         "supported_imports": ["pdf", "docx", "doc", "txt", "md", "png", "jpg", "jpeg", "webp", "tiff", "bmp", "psd", "html", "csv", "json"],
@@ -68,7 +95,8 @@ def get_admin_overview(
         "worker_health": {
             "status": "healthy",
             "isolated_network": True,
-            "installed_ocr_languages": get_installed_tesseract_languages(),
+            "ocr_execution_mode": "local_or_worker" if _safe_ocr_languages() else "worker_daemon",
+            "installed_ocr_languages": _safe_ocr_languages(),
         },
         "quotas": {
             "max_upload_bytes": settings.MAX_UPLOAD_BYTES,

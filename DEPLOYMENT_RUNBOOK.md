@@ -33,9 +33,13 @@ When `STORAGE_BACKEND=s3`, configure bucket CORS to allow `PUT` and `GET` from y
 ]
 ```
 
-### Vercel Frontend + Docker Backend/Worker Architecture
-- Root `vercel.json` is configured for a **frontend-only Next.js deployment** (`frontend/`), so Vercel does **not** bundle the Python backend (which exceeds Vercel's 500 MB Lambda limit due to OCR/PDF/office dependencies). If you set Root Directory to `frontend` in Vercel Project Settings, keep `NEXT_PUBLIC_API_URL` configured in Vercel's build environment variables.
-- Deploy FastAPI (`backend`), Celery (`worker`), PostgreSQL (`postgres`), Redis (`redis`), and private object storage (`minio` or external S3) on a Docker host using `docker-compose.yml` (`docker compose up --build -d backend worker`). Do **not** publish PostgreSQL (`5432`) or Redis (`6379`) ports publicly; `docker-compose.yml` isolates them on `internal_net`.
+### Vercel Frontend + API/Worker Dependency Split
+- Root `vercel.json` is currently configured for a **frontend-only Next.js deployment** (`frontend/`), so Vercel does **not** bundle the Python backend until the Vercel account plan/Services/Daemons capabilities and managed PostgreSQL/Redis/S3 resources are verified.
+- **Lightweight API vs. Worker split:**
+  - `backend/requirements-api.txt` + `backend/Dockerfile.api` contain only the FastAPI API dependencies and dispatch Celery jobs by stable task names (`app.tasks.finalize_upload`, `app.tasks.process_extraction_job`, `app.tasks.generate_export`, `app.tasks.generate_batch_zip`) without importing `app.tasks`, `cv2`, `numpy`, `pytesseract`, `PIL`, `fitz`, or `psd_tools`.
+  - `backend/requirements.txt` + `backend/Dockerfile.worker` contain the full OCR/document/office stack (`tesseract-ocr-tam`, `tesseract-ocr-eng`, `poppler-utils`, `libreoffice-writer`, `fonts-noto-core`, `fonts-noto-extra`, PyMuPDF, OpenCV) for the Celery worker (`celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2`).
+  - `/api/v1/capabilities` and `/api/v1/admin/overview` report `ocr_execution_mode: "worker_daemon"` and `verified_locally: false` when running in the lightweight API environment without local OCR binaries.
+- For Docker Compose hosting, `docker-compose.yml` runs FastAPI (`backend`), Celery (`worker`), PostgreSQL (`postgres`), Redis (`redis`), and private object storage (`minio` or external S3) with PostgreSQL (`5432`) and Redis (`6379`) isolated on `internal_net`.
 
 ## 3. Build, Migrate & Start
 ```bash

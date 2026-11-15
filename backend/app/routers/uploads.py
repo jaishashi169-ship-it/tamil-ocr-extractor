@@ -12,7 +12,6 @@ from app.dispatch import dispatch_celery_or_fallback
 from app.models import Job, UploadSession, User
 from app.security import detect_format_by_signature, sanitize_filename
 from app.storage import storage
-from app.tasks import finalize_upload_sync, finalize_upload_task
 
 router = APIRouter(prefix="/uploads", tags=["Uploads"])
 settings = get_settings()
@@ -347,9 +346,9 @@ def complete_upload(
 
     dispatch_celery_or_fallback(
         background_tasks=background_tasks,
-        celery_task=finalize_upload_task,
+        task_name="app.tasks.finalize_upload",
         args=[session.id],
-        sync_fn=finalize_upload_sync,
+        sync_fn_name="finalize_upload_sync",
         on_failed=_on_failed,
         resource_id=session.id,
     )

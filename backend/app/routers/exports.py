@@ -12,12 +12,6 @@ from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import ExportArtifact, Job, User
 from app.storage import storage
-from app.tasks import (
-    generate_batch_zip_sync,
-    generate_batch_zip_task,
-    generate_export_sync,
-    generate_export_task,
-)
 
 router = APIRouter(tags=["Exports & Downloads"])
 settings = get_settings()
@@ -86,9 +80,9 @@ def create_export(
 
     dispatch_celery_or_fallback(
         background_tasks=background_tasks,
-        celery_task=generate_export_task,
+        task_name="app.tasks.generate_export",
         args=[art.id, payload.options],
-        sync_fn=generate_export_sync,
+        sync_fn_name="generate_export_sync",
         on_failed=_on_failed,
         resource_id=art.id,
     )
@@ -210,9 +204,9 @@ def create_batch_zip(
 
     dispatch_celery_or_fallback(
         background_tasks=background_tasks,
-        celery_task=generate_batch_zip_task,
+        task_name="app.tasks.generate_batch_zip",
         args=[art.id, current_user.id, payload.job_ids, payload.export_format, payload.quality_preset],
-        sync_fn=generate_batch_zip_sync,
+        sync_fn_name="generate_batch_zip_sync",
         on_failed=_on_failed,
         resource_id=art.id,
     )

@@ -13,7 +13,7 @@ from app.config import get_settings
 from app.database import SessionLocal
 from app.models import ExportArtifact, Job, PageResult, UploadSession, User
 from app.security import detect_format_by_signature
-from app.services.document_model import DocumentModel, PageModel, TextBlock
+from app.services.document_model import DocumentModel, PageModel, TextBlock, build_reviewed_document_model
 from app.services.exporters.export_service import generate_export_bytes
 from app.services.importers import CorruptFileError, PasswordRequiredError
 from app.services.importers.docx_importer import import_docx
@@ -271,48 +271,6 @@ def process_extraction_job_sync(
 @celery_app.task(bind=True, name="app.tasks.process_extraction_job")
 def process_extraction_job_task(self, job_id: str, password: Optional[str] = None) -> None:
     process_extraction_job_sync(job_id, password=password)
-
-
-def build_reviewed_document_model(job: Job, db: Any) -> DocumentModel:
-    pages = (
-        db.query(PageResult)
-        .filter(PageResult.job_id == job.id)
-        .order_by(PageResult.page_number.asc())
-        .all()
-    )
-    page_models: List[PageModel] = []
-    for p in pages:
-        pm = PageModel(**(p.model_json or {"page_number": p.page_number}))
-        if p.edited_text is not None and p.edited_text != p.raw_text:
-            edited_paras = [para.strip() for para in p.edited_text.split("\n\n") if para.strip()]
-            new_blocks: List[TextBlock] = []
-            for idx, para in enumerate(edited_paras):
-                orig_blk = pm.blocks[idx] if idx < len(pm.blocks) else None
-                new_blocks.append(
-                    TextBlock(
-                        id=orig_blk.id if orig_blk else f"edited-{p.page_number}-{idx}",
-                        block_type=orig_blk.block_type if orig_blk else "paragraph",
-                        heading_level=orig_blk.heading_level if orig_blk else None,
-                        text=para,
-                        raw_ocr_text=orig_blk.raw_ocr_text if orig_blk else None,
-                        language=pm.language_detected,
-                        extraction_method="user_edited",
-                        confidence=orig_blk.confidence if orig_blk else pm.confidence_avg,
-                        bbox=orig_blk.bbox if orig_blk else None,
-                        source_ref=orig_blk.source_ref if orig_blk else None,
-                    )
-                )
-            pm.blocks = new_blocks
-        page_models.append(pm)
-
-    return DocumentModel(
-        job_id=job.id,
-        source_filename=job.original_filename,
-        format_type=job.format_type,
-        conversion_mode=(job.settings_json or {}).get("conversion_mode", "clean_editable"),
-        pages=page_models,
-        metadata=job.metadata_json or {},
-    )
 
 
 def finalize_upload_sync(session_id: str) -> None:

@@ -10,7 +10,6 @@ from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import Draft, Job, UploadSession, User
 from app.storage import storage
-from app.tasks import process_extraction_job_sync, process_extraction_job_task
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 settings = get_settings()
@@ -71,9 +70,9 @@ def _dispatch_job(
 
     dispatch_celery_or_fallback(
         background_tasks=background_tasks,
-        celery_task=process_extraction_job_task,
+        task_name="app.tasks.process_extraction_job",
         args=[job.id, password],
-        sync_fn=process_extraction_job_sync,
+        sync_fn_name="process_extraction_job_sync",
         on_dispatched=_on_dispatched,
         on_fallback=_on_fallback,
         on_failed=_on_failed,

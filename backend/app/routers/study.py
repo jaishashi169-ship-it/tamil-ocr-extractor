@@ -7,9 +7,8 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, StudyItem, StudyProject, User
-from app.tasks import build_reviewed_document_model as _build_reviewed_document_model
+from app.services.document_model import build_reviewed_document_model as _build_reviewed_document_model
 from app.services.study.ai_provider import AIProviderUnconfiguredError, get_ai_provider_status
-from app.services.study.exporter import export_study_project
 from app.services.study.pipeline import run_study_pipeline
 
 router = APIRouter(prefix="/study", tags=["Study Studio"])
@@ -352,6 +351,8 @@ def export_study_project_endpoint(
 
     items = db.query(StudyItem).filter(StudyItem.project_id == proj.id).order_by(StudyItem.order_index.asc()).all()
     item_dicts = [_serialize_item(i) for i in items]
+
+    from app.services.study.exporter import export_study_project
 
     data_bytes, ext = export_study_project(
         proj.title,
