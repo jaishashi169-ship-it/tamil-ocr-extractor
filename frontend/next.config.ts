@@ -12,26 +12,28 @@ const PLACEHOLDER_API_PATTERNS = [
 ];
 
 if (process.env.VERCEL === "1") {
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.trim() || "";
+  const apiUrl = (process.env.NEXT_PUBLIC_API_URL?.trim() || "").replace(/\/+$/, "");
   if (!apiUrl) {
     throw new Error(
-      "NEXT_PUBLIC_API_URL must be set to your HTTPS backend API URL (including /api/v1) before building on Vercel."
+      "NEXT_PUBLIC_API_URL must be set to /api/v1 (same-origin service routing) or your HTTPS backend API URL before building on Vercel."
     );
   }
-  let parsed: URL;
-  try {
-    parsed = new URL(apiUrl);
-  } catch {
-    throw new Error(`NEXT_PUBLIC_API_URL is not a valid URL: "${apiUrl}"`);
-  }
-  if (parsed.protocol !== "https:") {
-    throw new Error("NEXT_PUBLIC_API_URL must use HTTPS for Vercel deployments.");
-  }
-  const host = parsed.hostname.toLowerCase();
-  if (PLACEHOLDER_API_PATTERNS.some((p) => host === p || host.includes(p))) {
-    throw new Error(
-      `NEXT_PUBLIC_API_URL cannot use a placeholder or local host ("${host}") on Vercel.`
-    );
+  if (apiUrl !== "/api/v1" && apiUrl !== "/api") {
+    let parsed: URL;
+    try {
+      parsed = new URL(apiUrl);
+    } catch {
+      throw new Error(`NEXT_PUBLIC_API_URL is not a valid URL: "${apiUrl}"`);
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error("NEXT_PUBLIC_API_URL must use HTTPS for Vercel deployments.");
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (PLACEHOLDER_API_PATTERNS.some((p) => host === p || host.includes(p))) {
+      throw new Error(
+        `NEXT_PUBLIC_API_URL cannot use a placeholder or local host ("${host}") on Vercel.`
+      );
+    }
   }
 }
 
