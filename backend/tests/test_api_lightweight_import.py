@@ -474,18 +474,38 @@ def test_direct_vercel_blob_sdk_upload_and_range_download_e2e(monkeypatch):
     )
     assert bad_path_res.status_code == 403
 
-    # Token replay is rejected (single-use enforcement): second authorize-blob call → 409
-    replay_res = client.post(
+    # Safe token recovery for unfinished session (lost response or expired token recovery)
+    recovery_res = client.post(
         f"/api/v1/uploads/{sid}/authorize-blob",
         json={
             "pathname": init_data["storage_key"],
             "upload_authorization_token": init_data["upload_authorization_token"],
         },
     )
-    assert replay_res.status_code == 409, f"Expected 409 replay rejection, got {replay_res.status_code}: {replay_res.text}"
-    assert "already been issued" in replay_res.json()["detail"].lower() or "replay" in replay_res.json()["detail"].lower()
+    assert recovery_res.status_code == 200, recovery_res.text
+    assert recovery_res.json()["reauthorized"] is True
+    assert recovery_res.json()["allow_overwrite"] is False
 
     finalize_upload_sync(sid)
+
+    # Post-finalization mutation rejection: reauthorization is strictly rejected after acceptance (409)
+    post_finalize_res = client.post(
+        f"/api/v1/uploads/{sid}/authorize-blob",
+        json={
+            "pathname": init_data["storage_key"],
+            "upload_authorization_token": init_data["upload_authorization_token"],
+        },
+    )
+    assert post_finalize_res.status_code == 409, post_finalize_res.text
+    assert "already finalized" in post_finalize_res.json()["detail"].lower()
+
+    # Post-finalization re-completion rejection: complete returns 409
+    double_complete = client.post(f"/api/v1/uploads/{sid}/complete", headers=headers)
+    assert double_complete.status_code == 409, double_complete.text
+
+    # Post-finalization abort rejection: cannot delete or replace finalized original
+    abort_completed = client.delete(f"/api/v1/uploads/{sid}", headers=headers)
+    assert abort_completed.status_code == 409, abort_completed.text
 
     status_res = client.get(f"/api/v1/uploads/{sid}", headers=headers)
     assert status_res.status_code == 200

@@ -93,9 +93,26 @@ def _acquire_budget_lock(db: Session) -> StorageBudgetState:
     """
     Acquire a row-level lock on the singleton StorageBudgetState row (id=1) so concurrent
     uploads and worker output generators cannot over-allocate the storage budget.
+    Ensures row id=1 exists via ON CONFLICT DO NOTHING so concurrent workers never race on initial INSERT.
     """
     cfg = get_settings()
     dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
+    now_utc = datetime.now(timezone.utc)
+
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = (
+            pg_insert(StorageBudgetState)
+            .values(
+                id=1,
+                total_budget_bytes=int(cfg.TOTAL_STORAGE_BUDGET_BYTES),
+                updated_at=now_utc,
+            )
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        db.execute(stmt)
+
     query = db.query(StorageBudgetState).filter(StorageBudgetState.id == 1)
     if dialect != "sqlite":
         query = query.with_for_update()
@@ -104,13 +121,13 @@ def _acquire_budget_lock(db: Session) -> StorageBudgetState:
         state = StorageBudgetState(
             id=1,
             total_budget_bytes=int(cfg.TOTAL_STORAGE_BUDGET_BYTES),
-            updated_at=datetime.now(timezone.utc),
+            updated_at=now_utc,
         )
         db.add(state)
         db.flush()
     else:
         state.total_budget_bytes = int(cfg.TOTAL_STORAGE_BUDGET_BYTES)
-        state.updated_at = datetime.now(timezone.utc)
+        state.updated_at = now_utc
         db.flush()
     return state
 

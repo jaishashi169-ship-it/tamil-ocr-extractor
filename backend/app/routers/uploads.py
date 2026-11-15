@@ -230,13 +230,6 @@ def authorize_blob_upload(
     if not expected_key or clean_pathname != expected_key:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload pathname does not match reserved storage key")
 
-    existing_markers = list(session.s3_parts_json or [])
-    if any(isinstance(p, dict) and p.get("blob_token_issued") for p in existing_markers):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Upload token has already been issued for this session; token replay is rejected.",
-        )
-
     active_res = (
         db.query(StorageReservation)
         .filter(
@@ -252,7 +245,15 @@ def authorize_blob_upload(
             detail="Storage reservation is no longer active for this upload session",
         )
 
-    existing_markers.append({"PartNumber": 1, "ETag": "vercel-blob-token-issued", "blob_token_issued": True})
+    # Track token issuance for safe recovery without stranding unfinished uploads,
+    # while allow_overwrite=False and the finalization guard strictly prevent mutation of finalized originals.
+    existing_markers = list(session.s3_parts_json or [])
+    token_issuance_count = sum(1 for p in existing_markers if isinstance(p, dict) and p.get("blob_token_issued"))
+    existing_markers.append({
+        "PartNumber": token_issuance_count + 1,
+        "ETag": "vercel-blob-token-issued",
+        "blob_token_issued": True,
+    })
     session.s3_parts_json = existing_markers
     session.received_chunks = sorted(set(list(session.received_chunks or []) + [0]))
     db.commit()
@@ -263,6 +264,7 @@ def authorize_blob_upload(
         "storage_key": expected_key,
         "expected_size_bytes": int(session.expected_size_bytes),
         "allow_overwrite": False,
+        "reauthorized": token_issuance_count > 0,
     }
 
 
