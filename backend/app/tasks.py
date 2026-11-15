@@ -476,7 +476,8 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
     """Run inside the Celery worker to verify Tesseract languages, registered tasks, and real bilingual Tamil-English OCR."""
     global _cached_worker_ocr_probe
     if _cached_worker_ocr_probe is None or force_reprobe:
-        from app.services.ocr_engine import get_ocr_status, ocr_pil_image
+        import tempfile
+        from app.services.ocr_engine import get_ocr_status, run_ocr_on_image
         from PIL import Image, ImageDraw, ImageFont
 
         ocr_info = get_ocr_status()
@@ -486,31 +487,40 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
         smoke_sample = ""
         if ocr_info.get("available") and "eng" in langs:
             try:
-                img = Image.new("RGB", (760, 180), color=(255, 255, 255))
-                draw = ImageDraw.Draw(img)
-                tamil_font = None
-                for candidate in (
-                    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
-                    "/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
-                    "C:/Windows/Fonts/Nirmala.ttf",
-                    "C:/Windows/Fonts/latha.ttf",
-                ):
-                    if Path(candidate).exists():
-                        tamil_font = ImageFont.truetype(candidate, 32)
-                        break
-                if tamil_font is not None and "tam" in langs:
-                    draw.text((24, 28), "தமிழ் ஆவணம்", fill=(0, 0, 0), font=tamil_font)
-                    draw.text((24, 96), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0), font=tamil_font)
-                else:
-                    draw.text((24, 60), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0))
-                res = ocr_pil_image(img, OCROptions(language="tam+eng" if "tam" in langs else "eng"))
-                smoke_sample = (res.get("text") or "").strip()
-                tamil_unicode_detected = any("\u0B80" <= ch <= "\u0BFF" for ch in smoke_sample)
-                bilingual_smoke_passed = (
-                    ("OCR" in smoke_sample.upper() or "TAMIL" in smoke_sample.upper() or "2026" in smoke_sample)
-                    and (tamil_unicode_detected or tamil_font is None)
-                )
-            except Exception:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    img_path = Path(tmpdir) / "bilingual_smoke.png"
+                    img = Image.new("RGB", (900, 220), color=(255, 255, 255))
+                    draw = ImageDraw.Draw(img)
+                    tamil_font = None
+                    for candidate in (
+                        "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+                        "/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
+                        "C:/Windows/Fonts/Nirmala.ttf",
+                        "C:/Windows/Fonts/latha.ttf",
+                    ):
+                        if Path(candidate).exists():
+                            tamil_font = ImageFont.truetype(candidate, 36)
+                            break
+                    if tamil_font is not None and "tam" in langs:
+                        draw.text((30, 30), "தமிழ் ஆவணம்", fill=(0, 0, 0), font=tamil_font)
+                        draw.text((30, 110), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0), font=tamil_font)
+                    else:
+                        draw.text((30, 70), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0))
+                    img.save(img_path, format="PNG")
+                    blocks, _conf, _warns = run_ocr_on_image(
+                        img_path,
+                        "bilingual_smoke.png",
+                        1,
+                        OCROptions(language="tam+eng" if "tam" in langs else "eng"),
+                    )
+                    smoke_sample = " ".join(b.text for b in blocks).strip()
+                    tamil_unicode_detected = any("\u0B80" <= ch <= "\u0BFF" for ch in smoke_sample)
+                    bilingual_smoke_passed = (
+                        ("OCR" in smoke_sample.upper() or "TAMIL" in smoke_sample.upper() or "2026" in smoke_sample)
+                        and (tamil_unicode_detected or tamil_font is None)
+                    )
+            except Exception as exc:
+                smoke_sample = f"error: {exc}"
                 bilingual_smoke_passed = False
 
         registered = sorted(t for t in celery_app.tasks.keys() if t.startswith("app.tasks."))
