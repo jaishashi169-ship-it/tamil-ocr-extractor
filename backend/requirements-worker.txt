@@ -1,0 +1,15 @@
+-r requirements.txt
+
+# Worker-only Document, Image & OCR Processing Dependencies
+PyMuPDF==1.25.2
+pytesseract==0.3.13
+Pillow==11.1.0
+opencv-python-headless==4.11.0.86
+numpy==2.2.1
+psd-tools==1.10.4
+beautifulsoup4==4.12.3
+markdown==3.7
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2

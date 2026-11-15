@@ -1,5 +1,4 @@
-# Exclude non-frontend directories and large local artifacts from Vercel deployments
-backend/
+# Exclude local virtualenvs, tests, samples, and build artifacts from Vercel deployments
 docs/
 private_storage/
 samples/
@@ -10,6 +9,10 @@ docker-compose.yml
 *.sqlite*
 .venv/
 venv/
+backend/.venv/
+backend/tests/
+backend/private_storage/
+backend/*.db
 __pycache__/
 .pytest_cache/
 frontend/.next/

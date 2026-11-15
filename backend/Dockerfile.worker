@@ -20,8 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt requirements-worker.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements-worker.txt
 
 COPY . /app
 
