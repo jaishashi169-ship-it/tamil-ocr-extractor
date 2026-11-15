@@ -9,6 +9,11 @@ from app.config import get_settings
 from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import Draft, Job, UploadSession, User
+from app.services.retention import (
+    StorageQuotaExceededError,
+    commit_storage_reservation,
+    release_all_job_storage_and_reservations,
+)
 from app.storage import storage
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
@@ -157,6 +162,28 @@ def create_job(
         expires_at=expires_at,
     )
     db.add(job)
+    db.flush()
+
+    try:
+        commit_storage_reservation(
+            db,
+            user_id=current_user.id,
+            resource_type="upload",
+            resource_id=session.id,
+            actual_bytes=int(session.expected_size_bytes),
+            new_resource_type="original",
+            new_resource_id=job.id,
+            storage_key=session.storage_key,
+            expires_at=expires_at,
+            commit=False,
+        )
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+
     db.commit()
     db.refresh(job)
 
@@ -209,6 +236,7 @@ def cancel_job(
     if job.status in {"queued", "running"}:
         job.status = "cancelled"
         job.stage_label = "Cancelled"
+        release_all_job_storage_and_reservations(db, job, delete_original=False, commit=False)
         db.commit()
         db.refresh(job)
     return _serialize_job(job)
@@ -259,10 +287,7 @@ def delete_job_now(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    storage.delete_key(job.original_storage_key)
-    storage.delete_prefix(f"jobs/{job.id}")
-    for exp in job.exports:
-        storage.delete_key(exp.storage_key)
+    release_all_job_storage_and_reservations(db, job, delete_original=True, commit=False)
     db.query(Draft).filter(Draft.job_id == job.id).delete()
     db.delete(job)
     db.commit()

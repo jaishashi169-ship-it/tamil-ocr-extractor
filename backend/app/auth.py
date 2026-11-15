@@ -52,6 +52,38 @@ def verify_download_token(token: str) -> dict:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Download link expired or invalid") from exc
 
 
+def create_upload_authorization_token(
+    user_id: str,
+    session_id: str,
+    storage_key: str,
+    expected_size_bytes: int,
+    expires_in_seconds: int = 900,
+) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+    payload = {
+        "sub": user_id,
+        "sid": session_id,
+        "key": storage_key,
+        "size": min(int(expected_size_bytes), int(settings.MAX_UPLOAD_BYTES)),
+        "type": "upload_authorization",
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_upload_authorization_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "upload_authorization":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid upload authorization token type")
+        return payload
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Upload authorization token expired or invalid",
+        ) from exc
+
+
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: Session = Depends(get_db),

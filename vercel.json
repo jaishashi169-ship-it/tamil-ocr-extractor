@@ -43,7 +43,25 @@
       }
     }
   },
+  "crons": [
+    {
+      "path": "/api/v1/internal/cron/retention",
+      "schedule": "0 3 * * *"
+    }
+  ],
   "rewrites": [
+    {
+      "source": "/api/blob/(.*)",
+      "destination": {
+        "service": "frontend"
+      }
+    },
+    {
+      "source": "/api/v1/(.*)",
+      "destination": {
+        "service": "backend"
+      }
+    },
     {
       "source": "/api/(.*)",
       "destination": {

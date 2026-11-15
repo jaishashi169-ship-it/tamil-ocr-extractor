@@ -47,4 +47,10 @@ celery_app.conf.update(
     redis_socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
     broker_use_ssl=build_celery_ssl_options(settings.CELERY_BROKER_URL),
     redis_backend_use_ssl=build_celery_ssl_options(settings.CELERY_RESULT_BACKEND),
+    beat_schedule={
+        "scheduled-retention-cleanup": {
+            "task": "app.tasks.run_scheduled_retention_cleanup",
+            "schedule": float(settings.RETENTION_CLEANUP_INTERVAL_SECONDS),
+        }
+    },
 )

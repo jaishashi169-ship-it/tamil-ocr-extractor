@@ -1,27 +1,47 @@
-import base64
+import contextvars
 import hashlib
-import hmac
-import json
 import os
 import re
 import shutil
 import tempfile
-import time
-import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 import boto3
-import httpx
 from botocore.client import Config
+from vercel._internal.core.session import get_active_sync_session
+from vercel.blob import sync as vercel_blob_sync
+from vercel.blob.errors import BlobNotFoundError
 
 from app.config import get_settings
 from app.security import safe_join
 
 settings = get_settings()
 
-VERCEL_BLOB_API_VERSION = "13"
 STREAM_CHUNK_BYTES = 262_144  # 256 KiB bounded streaming chunk size
+
+_write_hook_var: contextvars.ContextVar[Optional[Callable[[str, int], None]]] = contextvars.ContextVar(
+    "storage_write_hook", default=None
+)
+_delete_hook_var: contextvars.ContextVar[Optional[Callable[[str], None]]] = contextvars.ContextVar(
+    "storage_delete_hook", default=None
+)
+
+
+@contextmanager
+def bind_storage_hooks(
+    on_write: Optional[Callable[[str, int], None]] = None,
+    on_delete: Optional[Callable[[str], None]] = None,
+) -> Iterator[None]:
+    """Bind per-execution callbacks to enforce atomic storage reservations on every object write/delete."""
+    t_w = _write_hook_var.set(on_write)
+    t_d = _delete_hook_var.set(on_delete)
+    try:
+        yield
+    finally:
+        _write_hook_var.reset(t_w)
+        _delete_hook_var.reset(t_d)
 
 
 def parse_store_id_from_rw_token(token: str) -> str:
@@ -63,8 +83,8 @@ def parse_byte_range(range_header: Optional[str], total_size: int) -> Optional[t
 class PrivateStorage:
     """
     Private object storage supporting:
-    - Vercel Blob private storage (`STORAGE_BACKEND=vercel_blob`, `access='private'`)
-    - S3-compatible private object storage (`STORAGE_BACKEND=s3`)
+    - Vercel Blob private storage (`STORAGE_BACKEND=vercel_blob`, `access='private'`) via official `vercel.blob.sync` SDK
+    - S3-compatible private object storage (`STORAGE_BACKEND=s3`) via `boto3`
     - Local filesystem for non-production development/test (`STORAGE_BACKEND=local`)
     """
 
@@ -82,6 +102,7 @@ class PrivateStorage:
                 self.local_writable = False
         self._s3 = None
         self._s3_public = None
+        self._last_blob_env: tuple[str, str] = ("", "")
         if self.backend == "s3":
             self._init_s3()
 
@@ -128,27 +149,23 @@ class PrivateStorage:
             or "https://vercel.com/api/blob"
         ).rstrip("/")
 
-    def _construct_private_blob_url(self, key: str) -> str:
-        store_id = self._get_blob_store_id()
-        if not store_id:
-            raise RuntimeError("Invalid or missing BLOB_READ_WRITE_TOKEN (cannot resolve storeId).")
-        clean_key = key.lstrip("/")
-        encoded_path = urllib.parse.quote(clean_key, safe="/")
-        return f"https://{store_id}.private.blob.vercel-storage.com/{encoded_path}"
-
-    def _blob_api_headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def _sync_blob_sdk_env(self) -> None:
+        """Ensure official `vercel.blob.sync` SDK sees current server-side token and API URL."""
         token = self._get_blob_token()
-        store_id = self._get_blob_store_id()
-        if not token or not store_id:
+        api_url = self._get_blob_api_url()
+        if not token:
             raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured for Vercel Blob storage.")
-        headers = {
-            "authorization": f"Bearer {token}",
-            "x-api-version": VERCEL_BLOB_API_VERSION,
-            "x-vercel-blob-store-id": store_id,
-        }
-        if extra:
-            headers.update(extra)
-        return headers
+        os.environ["BLOB_READ_WRITE_TOKEN"] = token
+        os.environ["VERCEL_BLOB_API_URL"] = api_url
+        current_pair = (token, api_url)
+        if self._last_blob_env != current_pair:
+            self._last_blob_env = current_pair
+            try:
+                session = get_active_sync_session()
+                if hasattr(session, "_services"):
+                    session._services.clear()
+            except Exception:
+                pass
 
     def is_s3(self) -> bool:
         return self.backend == "s3" and self._s3 is not None
@@ -161,7 +178,7 @@ class PrivateStorage:
 
     def direct_upload_mode(self) -> str:
         if self.is_vercel_blob():
-            return "direct_blob"
+            return "vercel_blob"
         if self.is_s3():
             return "direct_s3"
         return "proxy"
@@ -176,30 +193,23 @@ class PrivateStorage:
                     "reason": "BLOB_READ_WRITE_TOKEN is missing or not in vercel_blob_rw_<storeId>_<secret> format.",
                 }
             try:
-                with httpx.Client(timeout=5.0) as client:
-                    res = client.get(
-                        f"{self._get_blob_api_url()}?limit=1",
-                        headers=self._blob_api_headers(),
-                    )
-                if res.status_code == 200:
-                    return {
-                        "ready": True,
-                        "backend": "vercel_blob",
-                        "store_id": store_id,
-                        "access": "private",
-                    }
+                self._sync_blob_sdk_env()
+                # Use official vercel.blob.sync.query_blobs(page_size=1) to probe store readiness
+                it = vercel_blob_sync.query_blobs(page_size=1)
+                next(it, None)
                 return {
-                    "ready": False,
+                    "ready": True,
                     "backend": "vercel_blob",
                     "store_id": store_id,
-                    "reason": f"Vercel Blob API probe returned HTTP {res.status_code}: {res.text[:200]}",
+                    "access": "private",
+                    "sdk": "vercel-blob",
                 }
             except Exception as exc:
                 return {
                     "ready": False,
                     "backend": "vercel_blob",
                     "store_id": store_id,
-                    "reason": f"Vercel Blob store unreachable: {exc}",
+                    "reason": f"Vercel Blob store unreachable via official SDK: {exc}",
                 }
 
         if self.backend == "s3":
@@ -223,59 +233,12 @@ class PrivateStorage:
             return {"ready": False, "backend": "local", "reason": "Local storage root is not writable"}
         return {"ready": True, "backend": "local"}
 
-    def generate_blob_client_token(
-        self,
-        pathname: str,
-        max_size_bytes: int = settings.MAX_UPLOAD_BYTES,
-        expires_in_seconds: int = 900,
-    ) -> str:
-        """
-        Mint a short-lived, pathname-scoped, size-bounded client token (`vercel_blob_client_...`)
-        signed via HMAC-SHA256. Never exposes BLOB_READ_WRITE_TOKEN to the browser.
-        """
-        token = self._get_blob_token()
-        store_id = self._get_blob_store_id()
-        if not token or not store_id:
-            raise RuntimeError("BLOB_READ_WRITE_TOKEN is not configured for Vercel Blob.")
-        clean_pathname = pathname.lstrip("/")
-        capped_bytes = min(int(max_size_bytes), int(settings.MAX_UPLOAD_BYTES))
-        valid_until_ms = int((time.time() + expires_in_seconds) * 1000)
-        payload_obj = {
-            "pathname": clean_pathname,
-            "maximumSizeInBytes": capped_bytes,
-            "addRandomSuffix": False,
-            "allowOverwrite": True,
-            "validUntil": valid_until_ms,
-        }
-        payload_b64 = base64.b64encode(
-            json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
-        ).decode("ascii")
-        signature = hmac.new(
-            token.encode("utf-8"),
-            payload_b64.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        encoded_inner = base64.b64encode(f"{signature}.{payload_b64}".encode("utf-8")).decode("ascii")
-        return f"vercel_blob_client_{store_id}_{encoded_inner}"
-
     def create_multipart_upload(self, key: str) -> str:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            params = urllib.parse.urlencode({"pathname": clean_key})
-            headers = self._blob_api_headers(
-                {
-                    "x-vercel-blob-access": "private",
-                    "x-add-random-suffix": "0",
-                    "x-allow-overwrite": "1",
-                    "x-mpu-action": "create",
-                }
-            )
-            with httpx.Client(timeout=20.0) as client:
-                res = client.post(f"{self._get_blob_api_url()}/mpu?{params}", headers=headers)
-                res.raise_for_status()
-                data = res.json()
-                return str(data["uploadId"])
-
+            # Browser uploads use official @vercel/blob/client (`upload` + `handleUpload`) directly;
+            # server-side uploads use official `vercel.blob.sync.multipart_upload_blob` context manager.
+            return "vercel-blob-sdk-managed"
         assert self._s3 is not None
         res = self._s3.create_multipart_upload(Bucket=settings.S3_BUCKET_NAME, Key=clean_key)
         return res["UploadId"]
@@ -304,30 +267,9 @@ class PrivateStorage:
     ) -> Dict[str, Any]:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            client_token = self.generate_blob_client_token(
-                pathname=clean_key,
-                max_size_bytes=max_size_bytes,
-                expires_in_seconds=expires_in,
+            raise RuntimeError(
+                "Vercel Blob uploads use the official @vercel/blob/client handleUpload flow (/api/blob/upload), not manual part presigning."
             )
-            params = urllib.parse.urlencode({"pathname": clean_key})
-            return {
-                "upload_url": f"{self._get_blob_api_url()}/mpu?{params}",
-                "method": "POST",
-                "headers": {
-                    "Authorization": f"Bearer {client_token}",
-                    "x-api-version": VERCEL_BLOB_API_VERSION,
-                    "x-vercel-blob-access": "private",
-                    "x-mpu-action": "upload",
-                    "x-mpu-key": urllib.parse.quote(clean_key, safe=""),
-                    "x-mpu-upload-id": upload_id,
-                    "x-mpu-part-number": str(part_number),
-                    "content-type": "application/octet-stream",
-                },
-                "part_number": part_number,
-                "expires_in_seconds": expires_in,
-                "upload_mode": "direct_blob",
-            }
-
         url = self.presign_upload_part(clean_key, upload_id, part_number, expires_in=expires_in)
         return {
             "upload_url": url,
@@ -340,40 +282,14 @@ class PrivateStorage:
 
     def complete_multipart_upload(self, key: str, upload_id: str, parts: list[dict]) -> None:
         clean_key = key.lstrip("/")
+        if self.is_vercel_blob():
+            # Official @vercel/blob/client `upload(..., { multipart: true })` completes the multipart upload directly.
+            return
+        assert self._s3 is not None
         sorted_parts = sorted(
             parts,
             key=lambda p: int(p.get("PartNumber") if "PartNumber" in p else p.get("partNumber", 0)),
         )
-        if self.is_vercel_blob():
-            blob_parts = [
-                {
-                    "partNumber": int(p.get("PartNumber") if "PartNumber" in p else p.get("partNumber", 0)),
-                    "etag": str(p.get("ETag") if "ETag" in p else p.get("etag", "")),
-                }
-                for p in sorted_parts
-            ]
-            params = urllib.parse.urlencode({"pathname": clean_key})
-            headers = self._blob_api_headers(
-                {
-                    "x-vercel-blob-access": "private",
-                    "x-add-random-suffix": "0",
-                    "x-allow-overwrite": "1",
-                    "content-type": "application/json",
-                    "x-mpu-action": "complete",
-                    "x-mpu-upload-id": upload_id,
-                    "x-mpu-key": urllib.parse.quote(clean_key, safe=""),
-                }
-            )
-            with httpx.Client(timeout=60.0) as client:
-                res = client.post(
-                    f"{self._get_blob_api_url()}/mpu?{params}",
-                    headers=headers,
-                    content=json.dumps(blob_parts).encode("utf-8"),
-                )
-                res.raise_for_status()
-            return
-
-        assert self._s3 is not None
         s3_parts = [
             {
                 "PartNumber": int(p.get("PartNumber") if "PartNumber" in p else p.get("partNumber", 0)),
@@ -409,14 +325,12 @@ class PrivateStorage:
     def head_object_size(self, key: str) -> int:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            blob_url = self._construct_private_blob_url(clean_key)
-            params = urllib.parse.urlencode({"url": blob_url})
-            with httpx.Client(timeout=15.0) as client:
-                res = client.get(f"{self._get_blob_api_url()}?{params}", headers=self._blob_api_headers())
-                if res.status_code == 404:
-                    raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}")
-                res.raise_for_status()
-                return int(res.json().get("size", 0))
+            self._sync_blob_sdk_env()
+            try:
+                meta = vercel_blob_sync.head_blob(clean_key)
+                return int(meta.size)
+            except BlobNotFoundError as exc:
+                raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}") from exc
 
         assert self._s3 is not None
         res = self._s3.head_object(Bucket=settings.S3_BUCKET_NAME, Key=clean_key)
@@ -425,19 +339,12 @@ class PrivateStorage:
     def read_head_bytes(self, key: str, num_bytes: int = 8192) -> bytes:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            blob_url = self._construct_private_blob_url(clean_key)
-            headers = {
-                "authorization": f"Bearer {self._get_blob_token()}",
-                "Range": f"bytes=0-{max(0, num_bytes - 1)}",
-            }
-            with httpx.Client(timeout=20.0) as client:
-                with client.stream("GET", blob_url, headers=headers) as res:
-                    if res.status_code == 404:
-                        raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}")
-                    res.raise_for_status()
-                    chunks = []
-                    remaining = num_bytes
-                    for chunk in res.iter_bytes():
+            self._sync_blob_sdk_env()
+            try:
+                chunks: list[bytes] = []
+                remaining = num_bytes
+                with vercel_blob_sync.stream_blob(clean_key, access="private") as download:
+                    for chunk in download:
                         if not chunk:
                             continue
                         take = chunk[:remaining]
@@ -445,7 +352,9 @@ class PrivateStorage:
                         remaining -= len(take)
                         if remaining <= 0:
                             break
-                    return b"".join(chunks)
+                return b"".join(chunks)
+            except BlobNotFoundError as exc:
+                raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}") from exc
 
         assert self._s3 is not None
         res = self._s3.get_object(
@@ -458,20 +367,18 @@ class PrivateStorage:
     def compute_sha256_streaming(self, key: str) -> tuple[int, str]:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            blob_url = self._construct_private_blob_url(clean_key)
-            headers = {"authorization": f"Bearer {self._get_blob_token()}"}
+            self._sync_blob_sdk_env()
             sha256 = hashlib.sha256()
             total = 0
-            with httpx.Client(timeout=120.0) as client:
-                with client.stream("GET", blob_url, headers=headers) as res:
-                    if res.status_code == 404:
-                        raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}")
-                    res.raise_for_status()
-                    for chunk in res.iter_bytes(chunk_size=STREAM_CHUNK_BYTES):
+            try:
+                with vercel_blob_sync.stream_blob(clean_key, access="private") as download:
+                    for chunk in download:
                         if chunk:
                             sha256.update(chunk)
                             total += len(chunk)
-            return total, sha256.hexdigest()
+                return total, sha256.hexdigest()
+            except BlobNotFoundError as exc:
+                raise FileNotFoundError(f"Vercel Blob object not found: {clean_key}") from exc
 
         assert self._s3 is not None
         res = self._s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=clean_key)
@@ -493,7 +400,7 @@ class PrivateStorage:
         chunk_size: int = STREAM_CHUNK_BYTES,
     ) -> Dict[str, Any]:
         """
-        Open an authenticated, bounded-memory byte stream for private downloads.
+        Open an authenticated, bounded-memory byte stream for private downloads using official SDKs.
         Supports HTTP Range / resume requests across Vercel Blob, S3, and local dev storage.
         Never buffers the full object into memory or /tmp.
         """
@@ -504,53 +411,60 @@ class PrivateStorage:
             base_headers["Content-Disposition"] = f'{disposition}; filename="{safe_disp_name}"'
 
         if self.is_vercel_blob():
-            blob_url = self._construct_private_blob_url(clean_key)
-            req_headers = {"authorization": f"Bearer {self._get_blob_token()}"}
-            if range_header:
-                req_headers["Range"] = range_header
-            client = httpx.Client(timeout=120.0)
-            req = client.build_request("GET", blob_url, headers=req_headers)
-            res = client.send(req, stream=True)
-            if res.status_code == 404:
-                res.close()
-                client.close()
-                raise FileNotFoundError(f"Storage object not found: {clean_key}")
-            if res.status_code == 416:
-                content_range = res.headers.get("content-range", "bytes */*")
-                res.close()
-                client.close()
-                raise ValueError(f"Unsatisfiable range: {content_range}")
-            if res.status_code not in (200, 206):
-                res.close()
-                client.close()
-                raise RuntimeError(f"Blob download failed with status {res.status_code}")
+            self._sync_blob_sdk_env()
+            try:
+                head_meta = vercel_blob_sync.head_blob(clean_key)
+            except BlobNotFoundError as exc:
+                raise FileNotFoundError(f"Storage object not found: {clean_key}") from exc
 
+            total_size = int(head_meta.size)
+            byte_range = parse_byte_range(range_header, total_size)
             out_headers = dict(base_headers)
-            for hdr_key, hdr_name in (
-                ("content-length", "Content-Length"),
-                ("content-range", "Content-Range"),
-                ("etag", "ETag"),
-                ("cache-control", "Cache-Control"),
-            ):
-                val = res.headers.get(hdr_key)
-                if val:
-                    out_headers[hdr_name] = val
-            resolved_media_type = res.headers.get("content-type") or media_type
+            if head_meta.etag:
+                out_headers["ETag"] = head_meta.etag
+            if head_meta.cache_control:
+                out_headers["Cache-Control"] = head_meta.cache_control
+            resolved_media_type = head_meta.content_type or media_type
 
-            def _iter_blob() -> Iterator[bytes]:
-                try:
-                    for chunk in res.iter_bytes(chunk_size=chunk_size):
-                        if chunk:
-                            yield chunk
-                finally:
-                    res.close()
-                    client.close()
+            if byte_range is not None:
+                start, end = byte_range
+                status_code = 206
+                length = end - start + 1
+                out_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+                out_headers["Content-Length"] = str(length)
+            else:
+                start, end = 0, max(0, total_size - 1)
+                status_code = 200
+                length = total_size
+                out_headers["Content-Length"] = str(total_size)
+
+            def _iter_blob_sdk() -> Iterator[bytes]:
+                if length <= 0:
+                    return
+                with vercel_blob_sync.stream_blob(clean_key, access="private") as download:
+                    offset = 0
+                    for chunk in download:
+                        if not chunk:
+                            continue
+                        chunk_start = offset
+                        chunk_end = offset + len(chunk) - 1
+                        offset += len(chunk)
+                        if chunk_end < start:
+                            continue
+                        if chunk_start > end:
+                            break
+                        slice_start = max(0, start - chunk_start)
+                        slice_end = min(len(chunk), end - chunk_start + 1)
+                        if slice_end > slice_start:
+                            yield chunk[slice_start:slice_end]
+                        if chunk_end >= end:
+                            break
 
             return {
-                "status_code": res.status_code,
+                "status_code": status_code,
                 "media_type": resolved_media_type,
                 "headers": out_headers,
-                "iterator": _iter_blob(),
+                "iterator": _iter_blob_sdk(),
             }
 
         if self.is_s3():
@@ -725,20 +639,19 @@ class PrivateStorage:
 
     def save_bytes(self, key: str, data: bytes) -> str:
         clean_key = key.lstrip("/")
+        write_hook = _write_hook_var.get()
+        if write_hook is not None:
+            write_hook(clean_key, len(data))
         if self.is_vercel_blob():
-            params = urllib.parse.urlencode({"pathname": clean_key})
-            headers = self._blob_api_headers(
-                {
-                    "x-vercel-blob-access": "private",
-                    "x-add-random-suffix": "0",
-                    "x-allow-overwrite": "1",
-                    "x-content-length": str(len(data)),
-                    "content-type": "application/octet-stream",
-                }
+            self._sync_blob_sdk_env()
+            vercel_blob_sync.put_blob(
+                clean_key,
+                data,
+                access="private",
+                content_type="application/octet-stream",
+                add_random_suffix=False,
+                allow_overwrite=True,
             )
-            with httpx.Client(timeout=60.0) as client:
-                res = client.put(f"{self._get_blob_api_url()}/?{params}", headers=headers, content=data)
-                res.raise_for_status()
             return clean_key
 
         if self.backend == "s3" and self._s3 is not None:
@@ -751,38 +664,33 @@ class PrivateStorage:
 
     def save_file(self, key: str, src_path: Path) -> str:
         clean_key = key.lstrip("/")
+        file_size = src_path.stat().st_size
         if self.is_vercel_blob():
-            file_size = src_path.stat().st_size
-            part_size = settings.S3_MULTIPART_PART_BYTES
+            self._sync_blob_sdk_env()
+            part_size = max(5 * 1024 * 1024, settings.S3_MULTIPART_PART_BYTES)
             if file_size > part_size:
-                upload_id = self.create_multipart_upload(clean_key)
-                parts = []
-                params = urllib.parse.urlencode({"pathname": clean_key})
-                with httpx.Client(timeout=60.0) as client, open(src_path, "rb") as f:
-                    part_num = 1
-                    while True:
-                        chunk = f.read(part_size)
-                        if not chunk:
-                            break
-                        headers = self._blob_api_headers(
-                            {
-                                "x-vercel-blob-access": "private",
-                                "x-mpu-action": "upload",
-                                "x-mpu-key": urllib.parse.quote(clean_key, safe=""),
-                                "x-mpu-upload-id": upload_id,
-                                "x-mpu-part-number": str(part_num),
-                                "content-type": "application/octet-stream",
-                            }
-                        )
-                        res = client.post(f"{self._get_blob_api_url()}/mpu?{params}", headers=headers, content=chunk)
-                        res.raise_for_status()
-                        etag = str(res.json().get("etag", ""))
-                        parts.append({"partNumber": part_num, "etag": etag})
-                        part_num += 1
-                self.complete_multipart_upload(clean_key, upload_id, parts)
+                write_hook = _write_hook_var.get()
+                if write_hook is not None:
+                    write_hook(clean_key, file_size)
+                with vercel_blob_sync.multipart_upload_blob(
+                    clean_key,
+                    access="private",
+                    content_type="application/octet-stream",
+                    add_random_suffix=False,
+                    allow_overwrite=True,
+                ) as mpu:
+                    with open(src_path, "rb") as f:
+                        while True:
+                            chunk = f.read(part_size)
+                            if not chunk:
+                                break
+                            mpu.upload_part(chunk)
                 return clean_key
             return self.save_bytes(clean_key, src_path.read_bytes())
 
+        write_hook = _write_hook_var.get()
+        if write_hook is not None:
+            write_hook(clean_key, file_size)
         if self.backend == "s3" and self._s3 is not None:
             self._s3.upload_file(str(src_path), settings.S3_BUCKET_NAME, clean_key)
             return clean_key
@@ -795,22 +703,21 @@ class PrivateStorage:
     def get_local_file(self, key: str) -> Path:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
+            self._sync_blob_sdk_env()
             scratch_path = self.scratch_path_for(clean_key)
             if not scratch_path.exists():
-                blob_url = self._construct_private_blob_url(clean_key)
-                headers = {"authorization": f"Bearer {self._get_blob_token()}"}
                 tmp_path = scratch_path.with_suffix(scratch_path.suffix + ".downloading")
                 try:
-                    with httpx.Client(timeout=120.0) as client:
-                        with client.stream("GET", blob_url, headers=headers) as res:
-                            if res.status_code == 404:
-                                raise FileNotFoundError(f"Storage object not found: {clean_key}")
-                            res.raise_for_status()
-                            with open(tmp_path, "wb") as out_f:
-                                for chunk in res.iter_bytes(chunk_size=STREAM_CHUNK_BYTES):
-                                    if chunk:
-                                        out_f.write(chunk)
+                    with vercel_blob_sync.stream_blob(clean_key, access="private") as download:
+                        with open(tmp_path, "wb") as out_f:
+                            for chunk in download:
+                                if chunk:
+                                    out_f.write(chunk)
                     tmp_path.replace(scratch_path)
+                except BlobNotFoundError as exc:
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+                    raise FileNotFoundError(f"Storage object not found: {clean_key}") from exc
                 except Exception:
                     if tmp_path.exists():
                         tmp_path.unlink(missing_ok=True)
@@ -833,14 +740,12 @@ class PrivateStorage:
     def read_bytes(self, key: str) -> bytes:
         clean_key = key.lstrip("/")
         if self.is_vercel_blob():
-            blob_url = self._construct_private_blob_url(clean_key)
-            headers = {"authorization": f"Bearer {self._get_blob_token()}"}
-            with httpx.Client(timeout=60.0) as client:
-                res = client.get(blob_url, headers=headers)
-                if res.status_code == 404:
-                    raise FileNotFoundError(f"Storage object not found: {clean_key}")
-                res.raise_for_status()
-                return res.content
+            self._sync_blob_sdk_env()
+            try:
+                res = vercel_blob_sync.get_blob(clean_key, access="private")
+                return bytes(res.body)
+            except BlobNotFoundError as exc:
+                raise FileNotFoundError(f"Storage object not found: {clean_key}") from exc
         if self.backend == "s3" and self._s3 is not None:
             res = self._s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=clean_key)
             return res["Body"].read()
@@ -850,6 +755,12 @@ class PrivateStorage:
         if not key:
             return
         clean_key = key.lstrip("/")
+        delete_hook = _delete_hook_var.get()
+        if delete_hook is not None:
+            try:
+                delete_hook(clean_key)
+            except Exception:
+                pass
         for root in (self.local_root, self.scratch_root):
             try:
                 path = safe_join(root, *clean_key.split("/"))
@@ -859,14 +770,8 @@ class PrivateStorage:
                 pass
         if self.is_vercel_blob():
             try:
-                blob_url = self._construct_private_blob_url(clean_key)
-                headers = self._blob_api_headers({"content-type": "application/json"})
-                with httpx.Client(timeout=15.0) as client:
-                    client.post(
-                        f"{self._get_blob_api_url()}/delete",
-                        headers=headers,
-                        content=json.dumps({"urls": [blob_url]}).encode("utf-8"),
-                    )
+                self._sync_blob_sdk_env()
+                vercel_blob_sync.delete_blob(clean_key)
             except Exception:
                 pass
         elif self.backend == "s3" and self._s3 is not None:
@@ -886,29 +791,15 @@ class PrivateStorage:
                 pass
         if self.is_vercel_blob():
             try:
-                cursor: Optional[str] = None
-                with httpx.Client(timeout=20.0) as client:
-                    while True:
-                        q: Dict[str, str] = {"prefix": clean_prefix, "limit": "500"}
-                        if cursor:
-                            q["cursor"] = cursor
-                        res = client.get(
-                            f"{self._get_blob_api_url()}?{urllib.parse.urlencode(q)}",
-                            headers=self._blob_api_headers(),
-                        )
-                        if res.status_code != 200:
-                            break
-                        payload = res.json()
-                        urls = [b["url"] for b in payload.get("blobs", []) if b.get("url")]
-                        if urls:
-                            client.post(
-                                f"{self._get_blob_api_url()}/delete",
-                                headers=self._blob_api_headers({"content-type": "application/json"}),
-                                content=json.dumps({"urls": urls}).encode("utf-8"),
-                            )
-                        if not payload.get("hasMore") or not payload.get("cursor"):
-                            break
-                        cursor = payload.get("cursor")
+                self._sync_blob_sdk_env()
+                batch: list[str] = []
+                for item in vercel_blob_sync.query_blobs(prefix=clean_prefix, page_size=500):
+                    batch.append(item.url)
+                    if len(batch) >= 500:
+                        vercel_blob_sync.delete_blob(batch)
+                        batch.clear()
+                if batch:
+                    vercel_blob_sync.delete_blob(batch)
             except Exception:
                 pass
         elif self.backend == "s3" and self._s3 is not None:
@@ -924,26 +815,8 @@ class PrivateStorage:
     def get_total_usage_bytes(self) -> int:
         if self.is_vercel_blob():
             try:
-                total = 0
-                cursor: Optional[str] = None
-                with httpx.Client(timeout=15.0) as client:
-                    while True:
-                        q: Dict[str, str] = {"limit": "1000"}
-                        if cursor:
-                            q["cursor"] = cursor
-                        res = client.get(
-                            f"{self._get_blob_api_url()}?{urllib.parse.urlencode(q)}",
-                            headers=self._blob_api_headers(),
-                        )
-                        if res.status_code != 200:
-                            break
-                        payload = res.json()
-                        for b in payload.get("blobs", []):
-                            total += int(b.get("size", 0))
-                        if not payload.get("hasMore") or not payload.get("cursor"):
-                            break
-                        cursor = payload.get("cursor")
-                return total
+                self._sync_blob_sdk_env()
+                return sum(int(item.size) for item in vercel_blob_sync.query_blobs(page_size=1000))
             except Exception:
                 return 0
 

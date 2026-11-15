@@ -1,4 +1,5 @@
 import io
+import threading
 import time
 import uuid
 import zipfile
@@ -22,8 +23,14 @@ from app.services.importers.pdf_importer import import_pdf
 from app.services.importers.psd_importer import import_psd
 from app.services.importers.text_importer import import_structured_or_text
 from app.services.ocr_engine import OCROptions, OCRUnavailableError
-from app.services.retention import enforce_storage_budget_and_quota
-from app.storage import storage
+from app.services.retention import (
+    StorageQuotaExceededError,
+    cleanup_expired_resources,
+    commit_storage_reservation,
+    release_all_job_storage_and_reservations,
+    release_reservations_for_resource,
+)
+from app.storage import bind_storage_hooks, storage
 
 
 class StaleExecutionError(Exception):
@@ -146,18 +153,42 @@ def process_extraction_job_sync(
 
         fmt = job.format_type.lower()
         doc_model: DocumentModel
-        if fmt == "pdf":
-            doc_model = import_pdf(file_path, job.id, job.original_filename, ocr_opts, password=password, progress_cb=_on_progress)
-        elif fmt in {"docx", "doc"}:
-            doc_model = import_docx(file_path, job.id, job.original_filename, is_legacy_doc=(fmt == "doc"), progress_cb=_on_progress)
-        elif fmt in {"png", "jpg", "jpeg", "webp", "tiff", "bmp"}:
-            doc_model = import_image(file_path, job.id, job.original_filename, fmt, ocr_opts, progress_cb=_on_progress)
-        elif fmt == "psd":
-            doc_model = import_psd(file_path, job.id, job.original_filename, ocr_opts, progress_cb=_on_progress)
-        elif fmt in {"txt", "md", "html", "csv", "json"}:
-            doc_model = import_structured_or_text(file_path, job.id, job.original_filename, fmt, progress_cb=_on_progress)
-        else:
-            raise ValueError(f"Unsupported format '{fmt}'.")
+        job_user_id = job.user_id
+        job_expires_at = job.expires_at
+
+        def _on_job_storage_write(clean_key: str, byte_size: int) -> None:
+            rtype = "temp_object" if "/tmp/" in clean_key else "preview"
+            commit_storage_reservation(
+                db,
+                user_id=job_user_id,
+                resource_type=rtype,
+                resource_id=f"{job_id}:{clean_key}",
+                actual_bytes=byte_size,
+                storage_key=clean_key,
+                expires_at=job_expires_at,
+                commit=True,
+            )
+
+        def _on_job_storage_delete(clean_key: str) -> None:
+            release_reservations_for_resource(
+                db,
+                resource_id=f"{job_id}:{clean_key}",
+                commit=True,
+            )
+
+        with bind_storage_hooks(on_write=_on_job_storage_write, on_delete=_on_job_storage_delete):
+            if fmt == "pdf":
+                doc_model = import_pdf(file_path, job.id, job.original_filename, ocr_opts, password=password, progress_cb=_on_progress)
+            elif fmt in {"docx", "doc"}:
+                doc_model = import_docx(file_path, job.id, job.original_filename, is_legacy_doc=(fmt == "doc"), progress_cb=_on_progress)
+            elif fmt in {"png", "jpg", "jpeg", "webp", "tiff", "bmp"}:
+                doc_model = import_image(file_path, job.id, job.original_filename, fmt, ocr_opts, progress_cb=_on_progress)
+            elif fmt == "psd":
+                doc_model = import_psd(file_path, job.id, job.original_filename, ocr_opts, progress_cb=_on_progress)
+            elif fmt in {"txt", "md", "html", "csv", "json"}:
+                doc_model = import_structured_or_text(file_path, job.id, job.original_filename, fmt, progress_cb=_on_progress)
+            else:
+                raise ValueError(f"Unsupported format '{fmt}'.")
 
         # Verify ownership before mutating PageResult rows or marking completed
         still_owner = (
@@ -219,12 +250,32 @@ def process_extraction_job_sync(
         return
     except InterruptedError:
         db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
         _mark_job_terminal_if_owned(
             db, job_id, execution_token,
             {Job.status: "cancelled", Job.stage_label: "Cancelled"},
         )
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
+        _mark_job_terminal_if_owned(
+            db, job_id, execution_token,
+            {
+                Job.status: "failed",
+                Job.stage_label: "Storage budget exceeded",
+                Job.error_message: str(exc),
+                Job.duration_ms: int((time.monotonic() - start_ts) * 1000),
+            },
+        )
     except PasswordRequiredError as exc:
         db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
         _mark_job_terminal_if_owned(
             db, job_id, execution_token,
             {
@@ -236,6 +287,9 @@ def process_extraction_job_sync(
         )
     except OCRUnavailableError as exc:
         db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
         _mark_job_terminal_if_owned(
             db, job_id, execution_token,
             {
@@ -247,6 +301,9 @@ def process_extraction_job_sync(
         )
     except (CorruptFileError, ValueError) as exc:
         db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
         _mark_job_terminal_if_owned(
             db, job_id, execution_token,
             {
@@ -258,6 +315,9 @@ def process_extraction_job_sync(
         )
     except Exception as exc:
         db.rollback()
+        job_row = db.query(Job).filter(Job.id == job_id).first()
+        if job_row:
+            release_all_job_storage_and_reservations(db, job_row, delete_original=False, commit=True)
         _mark_job_terminal_if_owned(
             db, job_id, execution_token,
             {
@@ -280,10 +340,10 @@ def process_extraction_job_task(self, job_id: str, password: Optional[str] = Non
 def finalize_upload_sync(session_id: str) -> None:
     """
     Durable worker finalization for uploads:
-    - Completes S3 multipart or assembles local chunks.
-    - Enforces 500 MB size limit and magic-byte content signature.
+    - Completes S3 multipart or verifies official Vercel Blob upload or assembles local chunks.
+    - Enforces 500 MB size limit, magic-byte content signature, and atomic storage reservation commit.
     - Computes streaming SHA-256 outside FastAPI request handlers.
-    - Marks session 'completed' only after all validation succeeds.
+    - Marks session 'completed' only after all validation succeeds; releases reservation on failure.
     """
     settings = get_settings()
     db = SessionLocal()
@@ -295,17 +355,20 @@ def finalize_upload_sync(session_id: str) -> None:
 
         if session.s3_upload_id and session.storage_key and storage.is_direct_multipart():
             dest_key = session.storage_key
-            parts = sorted(session.s3_parts_json or [], key=lambda p: p.get("PartNumber", 0))
-            expected_parts = list(range(1, session.total_chunks + 1))
-            if [p.get("PartNumber") for p in parts] != expected_parts:
-                session.status = "failed"
-                db.commit()
-                return
+            if session.s3_upload_id != "vercel-blob-sdk-managed":
+                parts = sorted(session.s3_parts_json or [], key=lambda p: p.get("PartNumber", 0))
+                expected_parts = list(range(1, session.total_chunks + 1))
+                if [p.get("PartNumber") for p in parts] != expected_parts:
+                    release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
+                    session.status = "failed"
+                    db.commit()
+                    return
+                storage.complete_multipart_upload(dest_key, session.s3_upload_id, parts)
 
-            storage.complete_multipart_upload(dest_key, session.s3_upload_id, parts)
             actual_bytes = storage.head_object_size(dest_key)
             if actual_bytes > settings.MAX_UPLOAD_BYTES:
                 storage.delete_key(dest_key)
+                release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
                 session.status = "aborted"
                 db.commit()
                 return
@@ -314,6 +377,7 @@ def finalize_upload_sync(session_id: str) -> None:
             fmt, err = detect_format_by_signature(header, session.filename)
             if err or not fmt:
                 storage.delete_key(dest_key)
+                release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
                 session.status = "aborted"
                 db.commit()
                 return
@@ -325,6 +389,7 @@ def finalize_upload_sync(session_id: str) -> None:
             actual_bytes, sha256_hex = storage.assemble_chunks(session.id, session.total_chunks, dest_key)
             if actual_bytes > settings.MAX_UPLOAD_BYTES:
                 storage.delete_key(dest_key)
+                release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
                 session.status = "aborted"
                 db.commit()
                 return
@@ -335,9 +400,27 @@ def finalize_upload_sync(session_id: str) -> None:
             fmt, err = detect_format_by_signature(header, session.filename)
             if err or not fmt:
                 storage.delete_key(dest_key)
+                release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
                 session.status = "aborted"
                 db.commit()
                 return
+
+        try:
+            commit_storage_reservation(
+                db,
+                user_id=session.user_id,
+                resource_type="upload",
+                resource_id=session.id,
+                actual_bytes=actual_bytes,
+                storage_key=dest_key,
+                commit=False,
+            )
+        except StorageQuotaExceededError:
+            storage.delete_key(dest_key)
+            release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
+            session.status = "aborted"
+            db.commit()
+            return
 
         session.storage_key = dest_key
         session.sha256_hash = sha256_hex
@@ -349,6 +432,9 @@ def finalize_upload_sync(session_id: str) -> None:
         db.rollback()
         session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
         if session and session.status == "processing":
+            if session.storage_key:
+                storage.delete_key(session.storage_key)
+            release_reservations_for_resource(db, resource_type="upload", resource_id=session.id, commit=False)
             session.status = "failed"
             db.commit()
     finally:
@@ -362,7 +448,7 @@ def finalize_upload_task(self, session_id: str) -> None:
 
 
 def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = None) -> None:
-    """Generate a single-job export artifact in a worker and upload to private storage."""
+    """Generate a single-job export artifact in a worker, enforce atomic storage reservation, and upload."""
     db = SessionLocal()
     original_key_for_scratch_cleanup: Optional[str] = None
     try:
@@ -372,6 +458,7 @@ def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = N
         job = db.query(Job).filter(Job.id == art.job_id).first()
         user = db.query(User).filter(User.id == art.user_id).first()
         if not job or job.status != "completed":
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"
             db.commit()
             return
@@ -381,30 +468,51 @@ def generate_export_sync(artifact_id: str, options: Optional[Dict[str, Any]] = N
             doc_model, art.export_format, art.quality_preset, options or {}
         )
         if not data_bytes:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"
             db.commit()
             return
 
-        if user is not None:
-            enforce_storage_budget_and_quota(db, user, len(data_bytes))
-
+        retention_days = user.retention_days if user else get_settings().DEFAULT_RETENTION_DAYS
+        expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)
         stem = Path(job.original_filename).stem
         storage_key = f"jobs/{job.id}/exports/{stem}_{art.export_format}_{art.quality_preset}_{art.id[:8]}.{ext}"
+
+        # Enforce atomic storage capacity BEFORE writing export bytes to durable storage
+        commit_storage_reservation(
+            db,
+            user_id=art.user_id,
+            resource_type="export",
+            resource_id=art.id,
+            actual_bytes=len(data_bytes),
+            storage_key=storage_key,
+            expires_at=expires_at,
+            commit=True,
+        )
+
         storage.save_bytes(storage_key, data_bytes)
 
-        retention_days = user.retention_days if user else get_settings().DEFAULT_RETENTION_DAYS
         art.storage_key = storage_key
         art.file_size_bytes = len(data_bytes)
         art.uncompressed_size_bytes = baseline_bytes
         art.savings_percent = savings_pct
         art.warnings_json = warnings
         art.status = "completed"
-        art.expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)
+        art.expires_at = expires_at
         db.commit()
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if art:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
+            art.status = "failed"
+            art.warnings_json = [str(exc)]
+            db.commit()
     except Exception:
         db.rollback()
         art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
         if art:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"
             db.commit()
     finally:
@@ -424,7 +532,7 @@ def generate_batch_zip_sync(
     export_format: str,
     quality_preset: str,
 ) -> None:
-    """Generate a multi-job ZIP archive in a worker and upload to private storage."""
+    """Generate a multi-job ZIP archive in a worker, enforce atomic storage reservation, and upload."""
     db = SessionLocal()
     original_key_for_scratch_cleanup: Optional[str] = None
     try:
@@ -437,6 +545,7 @@ def generate_batch_zip_sync(
             .all()
         )
         if not jobs:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"
             db.commit()
             return
@@ -451,9 +560,22 @@ def generate_batch_zip_sync(
 
         zip_bytes = buf.getvalue()
         user = db.query(User).filter(User.id == user_id).first()
-        if user is not None:
-            enforce_storage_budget_and_quota(db, user, len(zip_bytes))
+        retention_days = user.retention_days if user else get_settings().DEFAULT_RETENTION_DAYS
+        expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)
         key = f"batches/{user_id}/batch_{art.id[:8]}.zip"
+
+        # Enforce atomic storage capacity BEFORE writing ZIP bytes to durable storage
+        commit_storage_reservation(
+            db,
+            user_id=user_id,
+            resource_type="export",
+            resource_id=art.id,
+            actual_bytes=len(zip_bytes),
+            storage_key=key,
+            expires_at=expires_at,
+            commit=True,
+        )
+
         storage.save_bytes(key, zip_bytes)
 
         art.storage_key = key
@@ -461,11 +583,21 @@ def generate_batch_zip_sync(
         art.uncompressed_size_bytes = len(zip_bytes)
         art.savings_percent = 0.0
         art.status = "completed"
+        art.expires_at = expires_at
         db.commit()
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
+        if art:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
+            art.status = "failed"
+            art.warnings_json = [str(exc)]
+            db.commit()
     except Exception:
         db.rollback()
         art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
         if art:
+            release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"
             db.commit()
     finally:
@@ -672,15 +804,82 @@ def publish_worker_heartbeat(force_reprobe: bool = False) -> Optional[Dict[str, 
         return None
 
 
+def run_scheduled_retention_cleanup_sync() -> Dict[str, Any]:
+    """Run periodic retention and reservation expiry cleanup against the database and storage."""
+    from app.services.retention import cleanup_expired_resources, get_storage_budget_snapshot
+
+    db = SessionLocal()
+    try:
+        cleaned = cleanup_expired_resources(db)
+        budget = get_storage_budget_snapshot(db)
+        return {
+            "status": "completed",
+            "cleaned": cleaned,
+            "storage_budget": budget,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        db.rollback()
+        return {
+            "status": "error",
+            "error": str(exc)[:300],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    finally:
+        db.close()
+
+
+if celery_app is not None:
+    @celery_app.task(name="app.tasks.run_scheduled_retention_cleanup", bind=True)
+    def run_scheduled_retention_cleanup(self) -> Dict[str, Any]:
+        return run_scheduled_retention_cleanup_sync()
+else:
+    def run_scheduled_retention_cleanup() -> Dict[str, Any]:
+        return run_scheduled_retention_cleanup_sync()
+
+
+_retention_scheduler_started = False
+
+
+def start_retention_scheduler_thread() -> bool:
+    """
+    Start a lightweight daemon thread inside the worker process that periodically
+    runs retention and expired-reservation cleanup, independent of user uploads.
+    """
+    global _retention_scheduler_started
+    if _retention_scheduler_started:
+        return False
+    _retention_scheduler_started = True
+
+    import threading
+
+    def _loop() -> None:
+        settings = get_settings()
+        interval = max(60, int(getattr(settings, "RETENTION_CLEANUP_INTERVAL_SECONDS", 900) or 900))
+        while True:
+            try:
+                run_scheduled_retention_cleanup_sync()
+                publish_worker_heartbeat(force_reprobe=False)
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    t = threading.Thread(target=_loop, name="retention-cleanup-scheduler", daemon=True)
+    t.start()
+    return True
+
+
 try:
     from celery.signals import heartbeat_sent, worker_ready
 
     @worker_ready.connect
     def _on_worker_ready(**_kwargs: Any) -> None:
         publish_worker_heartbeat(force_reprobe=True)
+        start_retention_scheduler_thread()
 
     @heartbeat_sent.connect
     def _on_worker_heartbeat(**_kwargs: Any) -> None:
         publish_worker_heartbeat(force_reprobe=False)
 except Exception:
     pass
+

@@ -11,7 +11,12 @@ from app.config import get_settings
 from app.database import get_db
 from app.dispatch import dispatch_celery_or_fallback
 from app.models import ExportArtifact, Job, User
-from app.services.retention import cleanup_expired_resources
+from app.services.retention import (
+    StorageQuotaExceededError,
+    cleanup_expired_resources,
+    release_reservations_for_resource,
+    reserve_storage_capacity,
+)
 from app.storage import storage
 
 router = APIRouter(tags=["Exports & Downloads"])
@@ -60,6 +65,7 @@ def create_export(
     if job.status != "completed":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job must be completed before exporting")
 
+    expires_at = datetime.now(timezone.utc) + timedelta(days=current_user.retention_days)
     art = ExportArtifact(
         job_id=job.id,
         user_id=current_user.id,
@@ -70,14 +76,35 @@ def create_export(
         file_size_bytes=0,
         warnings_json=[],
         status="processing",
-        expires_at=datetime.now(timezone.utc) + timedelta(days=current_user.retention_days),
+        expires_at=expires_at,
     )
     db.add(art)
+    db.flush()
+
+    estimated_export_bytes = max(4096, min(int(job.file_size_bytes or 0) // 4, 5_000_000))
+    try:
+        reserve_storage_capacity(
+            db,
+            user=current_user,
+            resource_type="export",
+            resource_id=art.id,
+            reserved_bytes=estimated_export_bytes,
+            expires_at=expires_at,
+            commit=False,
+        )
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+
     db.commit()
     db.refresh(art)
 
     def _on_failed() -> None:
         art.status = "failed"
+        release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
         db.commit()
 
     dispatch_celery_or_fallback(
@@ -185,6 +212,7 @@ def create_batch_zip(
     if not jobs:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No completed jobs found for batch ZIP")
 
+    expires_at = datetime.now(timezone.utc) + timedelta(days=current_user.retention_days)
     art = ExportArtifact(
         job_id=jobs[0].id,
         user_id=current_user.id,
@@ -196,14 +224,35 @@ def create_batch_zip(
         savings_percent=0.0,
         warnings_json=[],
         status="processing",
-        expires_at=datetime.now(timezone.utc) + timedelta(days=current_user.retention_days),
+        expires_at=expires_at,
     )
     db.add(art)
+    db.flush()
+
+    estimated_zip_bytes = max(8192, min(sum(int(j.file_size_bytes or 0) for j in jobs) // 4, 10_000_000))
+    try:
+        reserve_storage_capacity(
+            db,
+            user=current_user,
+            resource_type="export",
+            resource_id=art.id,
+            reserved_bytes=estimated_zip_bytes,
+            expires_at=expires_at,
+            commit=False,
+        )
+    except StorageQuotaExceededError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+
     db.commit()
     db.refresh(art)
 
     def _on_failed() -> None:
         art.status = "failed"
+        release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
         db.commit()
 
     dispatch_celery_or_fallback(

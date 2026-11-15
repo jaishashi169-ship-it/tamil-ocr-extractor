@@ -204,3 +204,31 @@ class SystemSetting(Base):
     key = Column(String(128), primary_key=True)
     value_json = Column(JSON, nullable=False, default=dict)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class StorageBudgetState(Base):
+    """Singleton row (id=1) used as a row-level lock to serialize atomic storage reservations."""
+
+    __tablename__ = "storage_budget_state"
+
+    id = Column(Integer, primary_key=True, default=1)
+    total_budget_bytes = Column(BigInteger, nullable=False, default=850_000_000)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class StorageReservation(Base):
+    """Atomic storage capacity reservation covering concurrent uploads, originals, previews, exports, and temp objects."""
+
+    __tablename__ = "storage_reservations"
+
+    id = Column(String(36), primary_key=True, default=new_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    resource_type = Column(String(32), nullable=False, index=True)  # upload | original | preview | export | temp_object
+    resource_id = Column(String(128), nullable=False, index=True)
+    storage_key = Column(String(512), nullable=True)
+    reserved_bytes = Column(BigInteger, nullable=False, default=0)
+    actual_bytes = Column(BigInteger, nullable=False, default=0)
+    status = Column(String(24), nullable=False, default="reserved", index=True)  # reserved | committed | released | expired
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)

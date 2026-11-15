@@ -47,8 +47,16 @@ class Settings(BaseSettings):
     JOB_LEASE_SECONDS: int = 300
     WORKER_MAX_MEMORY_MB: int = 2048
     DEFAULT_RETENTION_DAYS: int = 7
-    USER_STORAGE_QUOTA_BYTES: int = 750_000_000  # 750 MB per user (fits 500 MB upload + exports within 1 GB Hobby cap)
-    TOTAL_STORAGE_BUDGET_BYTES: int = 850_000_000  # 850 MB total storage budget ceiling (guards 1 GB Hobby cap)
+    RETENTION_CLEANUP_INTERVAL_SECONDS: int = 900  # Scheduled retention cleanup every 15 minutes
+    # Atomic storage reservation limits (Note: Hobby 1 GB Blob cap / 850 MB budget does NOT guarantee a 500 MB document plus derived page previews and exports will fit concurrently)
+    USER_STORAGE_QUOTA_BYTES: int = 750_000_000  # 750 MB per user atomic reservation ceiling
+    TOTAL_STORAGE_BUDGET_BYTES: int = 850_000_000  # 850 MB total store atomic reservation ceiling (guards 1 GB Hobby cap)
+
+    # Production readiness & restricted smoke-test upload gating
+    REQUIRE_READINESS_FOR_UPLOADS: bool = False  # Always enforced when APP_ENV == "production"
+    RESTRICTED_SMOKE_TEST_MODE: bool = False  # When True, only admin or X-Smoke-Test-Token requests may initiate uploads
+    SMOKE_TEST_SECRET: str = ""
+    CRON_SECRET: str = ""
 
     # Binaries
     TESSERACT_CMD: str = "tesseract"

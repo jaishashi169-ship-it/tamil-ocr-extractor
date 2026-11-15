@@ -1,77 +1,72 @@
 # Deployment & Operations Runbook — Tamil English Document Studio
 
-## 1. Prerequisites
-- Docker Engine 24+ and Docker Compose v2
-- Reverse proxy (Nginx / Caddy / ALB) with HTTPS (TLS 1.2+) and `client_max_body_size 25m` (to accommodate 5 MB upload chunks + multipart overhead)
-- Optional for Study Studio: `GEMINI_API_KEY` or `OPENAI_API_KEY`
+## 1. Architecture Overview (Vercel-Only Multi-Service + Worker Daemon)
+Root [`vercel.json`](file:///e:/AI%20WEB%20Application%20Development%20lists/Tamil%20OCR%20Extractor/vercel.json) defines a unified Vercel deployment with three components and a scheduled retention cron:
+- **`services.frontend` (`frontend/`):** Next.js 15 App Router frontend + server-side `@vercel/blob/client` `handleUpload` token route (`/api/blob/upload`).
+- **`services.backend` (`backend/app/main.py`):** Lightweight FastAPI API service (`backend/requirements.txt` without heavy worker packages). Dispatches Celery jobs by stable task names (`app.tasks.finalize_upload`, `app.tasks.process_extraction_job`, `app.tasks.generate_export`, `app.tasks.generate_batch_zip`, `app.tasks.run_scheduled_retention_cleanup`) without importing `app.tasks`, `cv2`, `numpy`, `pytesseract`, `PIL`, `fitz`, or `psd_tools`.
+- **`daemons.celery` (`backend/Dockerfile.worker`):** Containerized Celery worker daemon on Vercel Fluid compute (`2Gi` memory request in `iad1`, `--concurrency=2`) containing `tesseract-ocr`, `tesseract-ocr-tam`, `tesseract-ocr-eng`, `poppler-utils`, `libreoffice-writer`, `fonts-noto-core`, `fonts-noto-extra`, PyMuPDF, and OpenCV.
+- **`crons` (`/api/v1/internal/cron/retention`):** Platform-scheduled retention and expired-reservation cleanup (`0 3 * * *` daily on Hobby; complemented by the worker daemon's internal 15-minute scheduler thread and Celery Beat schedule).
 
-## 2. Configuration
-1. Copy `.env.example` to `.env`:
+---
+
+## 2. Official Vercel Blob Private Storage & Atomic Capacity Reservations
+### 2.1 Official SDK Integration (No Manual Token Signing)
+- **Browser / Next.js Server (`@vercel/blob` `^2.9.0`):**
+  - Client uploads use official `upload(storageKey, file, { access: 'private', handleUploadUrl: '/api/blob/upload', multipart: true, clientPayload })` from `@vercel/blob/client` in [`frontend/src/lib/api.ts`](file:///e:/AI%20WEB%20Application%20Development%20lists/Tamil%20OCR%20Extractor/frontend/src/lib/api.ts).
+  - Token exchange runs strictly server-side in [`frontend/src/app/api/blob/upload/route.ts`](file:///e:/AI%20WEB%20Application%20Development%20lists/Tamil%20OCR%20Extractor/frontend/src/app/api/blob/upload/route.ts) via official `handleUpload` from `@vercel/blob/client`, which verifies the upload session and active `StorageReservation` against `POST /api/v1/uploads/{session_id}/authorize-blob` before issuing a path-locked token (`maximumSizeInBytes`, `addRandomSuffix: false`, `allowOverwrite: true`).
+  - `BLOB_READ_WRITE_TOKEN` is **never** exposed to the browser or returned by any API endpoint.
+- **Python FastAPI & Celery Worker (`vercel-blob==0.6.0`):**
+  - [`backend/app/storage.py`](file:///e:/AI%20WEB%20Application%20Development%20lists/Tamil%20OCR%20Extractor/backend/app/storage.py) uses official `from vercel.blob import sync as vercel_blob_sync` (`put_blob`, `multipart_upload_blob`, `head_blob`, `stream_blob`, `get_blob`, `query_blobs`, `delete_blob`) with `access="private"`.
+  - Authenticated downloads stream in bounded `256 KiB` chunks with HTTP `Range` (`206 Partial Content`) support.
+  - Existing S3-compatible storage (`STORAGE_BACKEND=s3`) remains fully supported.
+
+### 2.2 Atomic Storage Reservations & Hobby Plan Capacity Note
+- **Atomic Reservation Ledger (`StorageBudgetState` + `StorageReservation`, Migration `0004_storage_reservations`):**
+  - Every storage allocation acquires a serialized lock on `StorageBudgetState(id=1)` (`SELECT ... FOR UPDATE` on PostgreSQL) via [`backend/app/services/retention.py`](file:///e:/AI%20WEB%20Application%20Development%20lists/Tamil%20OCR%20Extractor/backend/app/services/retention.py).
+  - Reservations cover **concurrent uploads (`"upload"`)**, **originals (`"original"`)**, **page previews (`"preview"`)**, **exports (`"export"`)**, and **temporary stored objects (`"temp_object"`)**.
+  - Limits are enforced both at upload initialization **and** during worker output generation (`bind_storage_hooks` in `process_extraction_job_sync`, `generate_export_sync`, and `generate_batch_zip_sync`).
+  - Failed jobs, failed exports, and abandoned/aborted uploads automatically delete partial storage objects and release their reservations.
+- **Important Hobby Storage Allowance Constraint:**
+  - On Vercel Hobby (`1 GB` hard store cap), `TOTAL_STORAGE_BUDGET_BYTES=850000000` (`850 MB`) and `USER_STORAGE_QUOTA_BYTES=750000000` (`750 MB`) prevent store suspension.
+  - **An `850 MB` total budget does NOT guarantee that every `500 MB` document plus its rendered page previews and generated exports will fit concurrently.** If active originals + reservations + generated outputs exceed `850 MB`, the reservation system deterministically rejects the operation with HTTP `413` / `StorageQuotaExceededError` and cleans up partial outputs.
+
+---
+
+## 3. Restricted Production Smoke Test (Before Opening Public Uploads)
+Because Vercel Fluid Compute Daemons (`daemons.celery`) execute in production deployments rather than ephemeral preview deployments:
+1. Keep public uploads gated during initial production verification by setting:
+   - `REQUIRE_READINESS_FOR_UPLOADS=true` (blocks `POST /api/v1/uploads/init` with HTTP `503 SYSTEM_NOT_READY_FOR_UPLOADS` whenever database, Redis broker, private storage, or verified OCR worker heartbeat is not ready).
+   - `RESTRICTED_SMOKE_TEST_MODE=true` and `SMOKE_TEST_SECRET=<strong-random-token>` (blocks public `POST /api/v1/uploads/init` with HTTP `403 RESTRICTED_SMOKE_TEST_MODE` unless the request includes `X-Smoke-Test-Token: <SMOKE_TEST_SECRET>` or an admin JWT).
+2. Run the restricted production smoke test script:
    ```bash
-   cp .env.example .env
+   python scripts/run_production_smoke_test.py \
+     --base-url https://tamilocrextraxtor.vercel.app \
+     --token "$SMOKE_TEST_SECRET"
    ```
-2. Set production values in `.env`:
-   - `APP_ENV=production`
-   - `SECRET_KEY=<64-char random hex string>` (startup fails if left at the dev placeholder or `<32` chars)
-   - `CORS_ORIGINS=https://your-frontend.vercel.app` (exact frontend origin(s), comma-separated; wildcard `*` is rejected in `APP_ENV=production`)
-   - `ALLOW_BACKGROUND_TASK_FALLBACK=false`
-   - `NEXT_PUBLIC_API_URL=https://api.your-domain.example/api/v1` (required for Vercel frontend builds; `api.ts` normalizes trailing slashes/`/api/v1` and fails clearly in production if unset)
-   - `STORAGE_BACKEND=s3` with `S3_ENDPOINT_URL`, `S3_PUBLIC_ENDPOINT_URL` (browser-reachable presigned URL host), `S3_BUCKET_NAME`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_REGION` for direct-to-storage 500 MB uploads/downloads (8 MiB multipart parts via `S3_MULTIPART_PART_BYTES=8388608`)
-   - `GEMINI_API_KEY` / `OPENAI_API_KEY` (if enabling Study Studio)
+3. Only set `RESTRICTED_SMOKE_TEST_MODE=false` after `/health/ready` returns `200`, `POST /api/v1/admin/smoke-test` returns `"smoke_test_passed": true`, and the full upload → OCR → edit → export → Study Studio workflow passes.
 
-### S3 / MinIO Bucket CORS (Required for Direct Browser Uploads)
-When `STORAGE_BACKEND=s3`, configure bucket CORS to allow `PUT` and `GET` from your frontend origin and expose `ETag` so the browser can register multipart part ETags:
-```json
-[
-  {
-    "AllowedOrigins": ["https://your-frontend.vercel.app"],
-    "AllowedMethods": ["GET", "PUT", "HEAD"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3600
-  }
-]
-```
+---
 
-### Vercel Frontend + API/Worker Dependency Split
-- Root `vercel.json` is currently configured for a **frontend-only Next.js deployment** (`frontend/`), so Vercel does **not** bundle the Python backend until the Vercel account plan/Services/Daemons capabilities and managed PostgreSQL/Redis/S3 resources are verified.
-- **Lightweight API vs. Worker split:**
-  - `backend/requirements-api.txt` + `backend/Dockerfile.api` contain only the FastAPI API dependencies and dispatch Celery jobs by stable task names (`app.tasks.finalize_upload`, `app.tasks.process_extraction_job`, `app.tasks.generate_export`, `app.tasks.generate_batch_zip`) without importing `app.tasks`, `cv2`, `numpy`, `pytesseract`, `PIL`, `fitz`, or `psd_tools`.
-  - `backend/requirements.txt` + `backend/Dockerfile.worker` contain the full OCR/document/office stack (`tesseract-ocr-tam`, `tesseract-ocr-eng`, `poppler-utils`, `libreoffice-writer`, `fonts-noto-core`, `fonts-noto-extra`, PyMuPDF, OpenCV) for the Celery worker (`celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2`).
-  - `/api/v1/capabilities` and `/api/v1/admin/overview` report `ocr_execution_mode: "worker_daemon"` and `verified_locally: false` when running in the lightweight API environment without local OCR binaries.
-- For Docker Compose hosting, `docker-compose.yml` runs FastAPI (`backend`), Celery (`worker`), PostgreSQL (`postgres`), Redis (`redis`), and private object storage (`minio` or external S3) with PostgreSQL (`5432`) and Redis (`6379`) isolated on `internal_net`.
-
-## 3. Build, Migrate & Start
-```bash
-docker compose up --build -d
-docker compose ps
-```
-The `backend` container runs `alembic upgrade head` before starting `uvicorn`. Verify the migration head:
-```bash
-docker compose exec backend alembic current
-# Expected: 0003_s3_direct_upload (head)
-```
-Verify OCR languages inside the isolated `worker` container:
-```bash
-docker compose exec worker tesseract --list-langs
-# Expected: eng, tam
-```
-
-## 4. Smoke Test
-Run the reproducible integration verification script against the deployed backend:
-```bash
-python scripts/verify_integration.py --base-url http://localhost:8000
-```
-
-## 5. Backup & Restore
-- **PostgreSQL:**
-  - Backup: `docker compose exec -T postgres pg_dump -U studio tamil_doc_studio > backup_$(date +%F).sql`
-  - Restore: `cat backup_YYYY-MM-DD.sql | docker compose exec -T postgres psql -U studio tamil_doc_studio`
-- **Private Storage Volume (`private_storage`):**
-  - Backup the Docker volume `/var/lib/docker/volumes/..._private_storage/_data` (or S3/MinIO bucket with versioning/replication in `STORAGE_BACKEND=s3` mode).
-
-## 6. Rollback Procedure
-1. Stop application containers: `docker compose stop frontend backend worker`
-2. If rolling back schema from `0002_worker_ownership` to `0001_initial`:
-   `docker compose run --rm backend alembic downgrade 0001_initial`
-3. Deploy the previous container image tag / source revision and start services: `docker compose up -d`.
+## 4. Worker Scaling, Quota Monitoring & Recovery Procedures
+### 4.1 Worker Scaling
+- **Vertical & Concurrency Tuning (`vercel.json` -> `daemons.celery`):**
+  - Default configuration runs `1` instance in `iad1` with `memory: "2Gi"` and `--concurrency=2` to stay within Hobby Fluid compute limits while isolating Tesseract/PyMuPDF memory peaks.
+  - To scale worker throughput on Pro/Enterprise plans, increase `daemons.celery.instances.iad1` (e.g., `2`–`4`) or increase `resources.requests.memory` to `"4Gi"` with `--concurrency=4`.
+### 4.2 Quota & Queue Monitoring
+- **Readiness Probe:** `GET /health/ready` (or `GET /api/v1/health/ready`) reports live readiness of PostgreSQL, Redis (`rediss://` with `ssl_cert_reqs=CERT_REQUIRED` + `certifi`), private storage (`vercel-blob` SDK `query_blobs(page_size=1)`), and the Celery worker's Redis heartbeat (`doc_studio:worker:status`, TTL `180s`).
+- **Quota & Reservation Breakdown:** `GET /api/v1/admin/quotas` returns:
+  - `storage_budget` (`total_used_bytes`, `active_reserved_bytes`, `active_committed_bytes`, `remaining_budget_bytes`),
+  - `utilization_percent` and `warning_level` (`normal` < 75%, `warning` ≥ 75%, `critical` ≥ 90%),
+  - `reservation_breakdown` grouped by `resource_type` (`upload`, `original`, `preview`, `export`, `temp_object`) and `status`,
+  - `queue_depth` (`queued_jobs`, `running_jobs`), and `worker_heartbeat`.
+### 4.3 Recovery Procedures
+- **Stuck / Orphaned Reservations or Expired Jobs:**
+  - Automatic recovery runs every 15 minutes inside the worker daemon (`run_scheduled_retention_cleanup_sync`) and daily via Vercel Cron (`GET /api/v1/internal/cron/retention` with `Authorization: Bearer <CRON_SECRET>`).
+  - Manual immediate cleanup: `POST /api/v1/admin/retention/cleanup` (as admin) or `curl -H "Authorization: Bearer $CRON_SECRET" https://tamilocrextraxtor.vercel.app/api/v1/internal/cron/retention`.
+- **Worker Heartbeat Loss (`worker.ready: false` on `/health/ready`):**
+  1. Check Redis connectivity and usage (`30 MB` cap on Redis Cloud Free) and ensure `noeviction` policy has not blocked writes.
+  2. Redeploy or restart the `celery` daemon and inspect worker startup logs for `publish_worker_heartbeat`.
+  3. While the worker is offline, `REQUIRE_READINESS_FOR_UPLOADS=true` automatically prevents new public uploads from accumulating in storage.
+- **Database Schema Migration & Rollback:**
+  - Upgrade to head (`0004_storage_reservations`): `alembic upgrade head`
+  - Downgrade one revision if rolling back: `alembic downgrade 0003_s3_direct_upload`

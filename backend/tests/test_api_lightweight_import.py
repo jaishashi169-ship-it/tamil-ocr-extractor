@@ -135,9 +135,7 @@ def test_production_safety_rejects_sqlite_and_local_storage():
     ).validate_production_safety()
 
 
-def test_vercel_blob_client_token_and_range_streaming(monkeypatch, tmp_path):
-    import base64
-    import json
+def test_vercel_blob_sdk_adapter_and_range_streaming(monkeypatch, tmp_path):
     import pytest
     from app.storage import PrivateStorage, parse_byte_range
 
@@ -148,33 +146,19 @@ def test_vercel_blob_client_token_and_range_streaming(monkeypatch, tmp_path):
     st.backend = "vercel_blob"
     assert st.is_vercel_blob() is True
     assert st.is_direct_multipart() is True
-    assert st.direct_upload_mode() == "direct_blob"
+    assert st.direct_upload_mode() == "vercel_blob"
+    # Verify manual token signing is completely removed in favor of official @vercel/blob/client + vercel-blob SDK
+    assert not hasattr(st, "generate_blob_client_token")
 
-    target = st.get_direct_part_upload_target(
-        key="uploads/u1/s1/sample.pdf",
-        upload_id="mpu_12345",
-        part_number=1,
-        max_size_bytes=500_000_000,
-        expires_in=900,
-    )
-    assert target["upload_mode"] == "direct_blob"
-    assert target["method"] == "POST"
-    auth_header = target["headers"]["Authorization"]
-    assert auth_header.startswith("Bearer vercel_blob_client_storexyz789_")
-    # Master secret must NEVER appear anywhere in target URL or headers
-    serialized_target = json.dumps(target)
-    assert rw_token not in serialized_target
-    assert "mastersecretneverexpose" not in serialized_target
-
-    client_token = auth_header.split(" ", 1)[1]
-    encoded_inner = client_token.split("_", 4)[4]
-    decoded_inner = base64.b64decode(encoded_inner).decode("utf-8")
-    _sig, payload_b64 = decoded_inner.split(".", 1)
-    payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
-    assert payload["pathname"] == "uploads/u1/s1/sample.pdf"
-    assert payload["maximumSizeInBytes"] == 500_000_000
-    assert payload["addRandomSuffix"] is False
-    assert payload["allowOverwrite"] is True
+    # Manual part presigning is rejected for Vercel Blob in favor of @vercel/blob/client handleUpload
+    with pytest.raises(RuntimeError, match="handleUpload"):
+        st.get_direct_part_upload_target(
+            key="uploads/u1/s1/sample.pdf",
+            upload_id="vercel-blob-sdk-managed",
+            part_number=1,
+            max_size_bytes=500_000_000,
+            expires_in=900,
+        )
 
     # Verify bounded-memory streaming & HTTP Range support
     local_st = PrivateStorage()
@@ -222,20 +206,35 @@ def test_edit_distance_cer_and_wer():
     assert sub_en["cer"] == round(1 / 21, 4)
 
 
-def test_retention_cleanup_and_storage_budget():
+def test_atomic_storage_reservations_and_output_enforcement():
+    """
+    Verify atomic storage reservations cover:
+    - Concurrent uploads
+    - Originals, previews, exports, and temporary stored objects
+    - Failed jobs and abandoned uploads releasing reserved bytes
+    """
     from datetime import datetime, timedelta, timezone
     import pytest
     from app.database import Base, SessionLocal, engine
-    from app.models import ExportArtifact, Job, User
+    from app.models import ExportArtifact, Job, StorageReservation, User
     from app.services.retention import (
         StorageQuotaExceededError,
-        cleanup_expired_resources,
+        commit_storage_reservation,
         enforce_storage_budget_and_quota,
+        get_storage_budget_snapshot,
+        release_all_job_storage_and_reservations,
+        release_reservations_for_resource,
+        reserve_storage_capacity,
     )
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
+        db.query(StorageReservation).delete()
+        db.query(ExportArtifact).delete()
+        db.query(Job).delete()
+        db.commit()
+
         user = User(
             email="quota-check@studio.local",
             hashed_password="x",
@@ -267,15 +266,77 @@ def test_retention_cleanup_and_storage_budget():
         )
         db.add_all([expired_job, active_job])
         db.commit()
+        db.refresh(active_job)
 
         # Opportunistic cleanup removes the 400 MB expired job, allowing a 250 MB upload (450 + 250 = 700 <= 750 MB)
         snap = enforce_storage_budget_and_quota(db, user, 250_000_000)
         assert snap["user_used_bytes"] == 450_000_000
 
-        # A 350 MB upload exceeds the 750 MB per-user quota (450 + 350 = 800 > 750 MB)
+        # Concurrent upload reservation #1 reserves 250 MB atomically -> total user usage becomes 700 MB
+        reserve_storage_capacity(
+            db,
+            user=user,
+            resource_type="upload",
+            resource_id="sess-concurrent-1",
+            reserved_bytes=250_000_000,
+            storage_key="uploads/c1.pdf",
+        )
+        snap_after_c1 = get_storage_budget_snapshot(db, user=user)
+        assert snap_after_c1["user_used_bytes"] == 700_000_000
+        assert snap_after_c1["active_reserved_bytes"] >= 250_000_000
+
+        # Concurrent upload reservation #2 of 100 MB is rejected because 700 + 100 = 800 > 750 MB quota!
         with pytest.raises(StorageQuotaExceededError, match="quota exceeded"):
-            enforce_storage_budget_and_quota(db, user, 350_000_000)
+            reserve_storage_capacity(
+                db,
+                user=user,
+                resource_type="upload",
+                resource_id="sess-concurrent-2",
+                reserved_bytes=100_000_000,
+                storage_key="uploads/c2.pdf",
+            )
+
+        # Output generation enforcement: preview/export exceeding remaining 50 MB quota is rejected
+        with pytest.raises(StorageQuotaExceededError):
+            reserve_storage_capacity(
+                db,
+                user=user,
+                resource_type="preview",
+                resource_id=f"{active_job.id}:1",
+                reserved_bytes=60_000_000,
+                storage_key=f"jobs/{active_job.id}/pages/page_0001.png",
+            )
+
+        # Preview within remaining 50 MB quota succeeds and commits actual size
+        reserve_storage_capacity(
+            db,
+            user=user,
+            resource_type="preview",
+            resource_id=f"{active_job.id}:1",
+            reserved_bytes=10_000_000,
+            storage_key=f"jobs/{active_job.id}/pages/page_0001.png",
+        )
+        commit_storage_reservation(
+            db,
+            user_id=user.id,
+            resource_type="preview",
+            resource_id=f"{active_job.id}:1",
+            actual_bytes=8_000_000,
+        )
+        assert get_storage_budget_snapshot(db, user=user)["active_committed_bytes"] >= 8_000_000
+
+        # Abandoning upload #1 releases its 250 MB reservation immediately
+        released_count = release_reservations_for_resource(
+            db, resource_type="upload", resource_id="sess-concurrent-1"
+        )
+        assert released_count == 1
+        assert get_storage_budget_snapshot(db, user=user)["user_used_bytes"] == 458_000_000
+
+        # Releasing all storage/reservations for a failed or deleted job cleans up preview reservations
+        release_all_job_storage_and_reservations(db, active_job, delete_original=False)
+        assert get_storage_budget_snapshot(db, user=user)["active_committed_bytes"] == 0
     finally:
+        db.query(StorageReservation).delete()
         db.query(ExportArtifact).delete()
         db.query(Job).delete()
         db.query(User).filter(User.email == "quota-check@studio.local").delete()
@@ -283,8 +344,10 @@ def test_retention_cleanup_and_storage_budget():
         db.close()
 
 
-def test_direct_vercel_blob_multipart_upload_and_range_download_e2e(monkeypatch):
+def test_direct_vercel_blob_sdk_upload_and_range_download_e2e(monkeypatch):
+    from contextlib import contextmanager
     import hashlib
+    from types import SimpleNamespace
     from fastapi.testclient import TestClient
     from app.main import app
     from app.storage import storage
@@ -296,101 +359,46 @@ def test_direct_vercel_blob_multipart_upload_and_range_download_e2e(monkeypatch)
 
     sample_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
     expected_sha256 = hashlib.sha256(sample_pdf).hexdigest()
-    completed_mpu = {}
+    fake_blob_url = "https://storee2e99.private.blob.vercel-storage.com/uploads/bilingual.pdf"
 
-    class _FakeStreamRes:
-        def __init__(self, data: bytes, status_code: int = 200, headers: dict | None = None):
-            self._data = data
-            self.status_code = status_code
-            self.headers = headers or {"content-length": str(len(data)), "content-type": "application/pdf"}
+    # Mock official vercel.blob.sync SDK methods matching exact vercel-blob==0.6.0 signatures
+    monkeypatch.setattr(
+        "app.storage.vercel_blob_sync.head_blob",
+        lambda url_or_path, **kwargs: SimpleNamespace(
+            size=len(sample_pdf),
+            url=fake_blob_url,
+            pathname=str(url_or_path),
+            content_type="application/pdf",
+            etag='"etag-sdk-1"',
+            cache_control="private, no-cache",
+        ),
+    )
 
-        def __enter__(self):
-            return self
+    @contextmanager
+    def _fake_stream_blob(url_or_path, *, access="private", **kwargs):
+        def _gen():
+            chunk_size = 262144
+            for i in range(0, len(sample_pdf), chunk_size):
+                yield sample_pdf[i : i + chunk_size]
 
-        def __exit__(self, *args):
-            pass
+        yield _gen()
 
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise RuntimeError(f"HTTP {self.status_code}")
-
-        def iter_bytes(self, chunk_size: int = 262144):
-            for i in range(0, len(self._data), chunk_size):
-                yield self._data[i : i + chunk_size]
-
-        def close(self):
-            pass
-
-    class _FakeHttpxClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def post(self, url, headers=None, content=None):
-            action = (headers or {}).get("x-mpu-action")
-            if action == "create":
-                class _R:
-                    status_code = 200
-                    def raise_for_status(self): pass
-                    def json(self): return {"key": "uploads/key.pdf", "uploadId": "blob_mpu_001"}
-                return _R()
-            if action == "complete":
-                completed_mpu["parts"] = content
-                class _R:
-                    status_code = 200
-                    def raise_for_status(self): pass
-                    def json(self): return {"url": "https://storee2e99.private.blob.vercel-storage.com/uploads/key.pdf"}
-                return _R()
-            class _R:
-                status_code = 200
-                def raise_for_status(self): pass
-                def json(self): return {}
-            return _R()
-
-        def get(self, url, headers=None):
-            class _R:
-                status_code = 200
-                def raise_for_status(self): pass
-                def json(self):
-                    if "url=" in url:
-                        return {"size": len(sample_pdf), "url": url}
-                    return {"blobs": [], "hasMore": False}
-            return _R()
-
-        def stream(self, method, url, headers=None):
-            rng = (headers or {}).get("Range")
-            if rng and rng.startswith("bytes=0-"):
-                end = int(rng.split("-")[1])
-                return _FakeStreamRes(sample_pdf[: end + 1], status_code=206)
-            return _FakeStreamRes(sample_pdf, status_code=200)
-
-        def build_request(self, method, url, headers=None):
-            return {"method": method, "url": url, "headers": headers or {}}
-
-        def send(self, req, stream=False):
-            rng = req["headers"].get("Range")
-            if rng == "bytes=0-7":
-                slice_data = sample_pdf[:8]
-                return _FakeStreamRes(
-                    slice_data,
-                    status_code=206,
-                    headers={
-                        "content-length": "8",
-                        "content-range": f"bytes 0-7/{len(sample_pdf)}",
-                        "content-type": "application/pdf",
-                    },
-                )
-            return _FakeStreamRes(sample_pdf, status_code=200)
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("app.storage.httpx.Client", _FakeHttpxClient)
+    monkeypatch.setattr("app.storage.vercel_blob_sync.stream_blob", _fake_stream_blob)
+    monkeypatch.setattr(
+        "app.storage.vercel_blob_sync.get_blob",
+        lambda url_or_path, *, access="private", **kwargs: SimpleNamespace(
+            body=sample_pdf,
+            metadata=SimpleNamespace(size=len(sample_pdf), status_code=200, content_type="application/pdf"),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.storage.vercel_blob_sync.delete_blob",
+        lambda url_or_path, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.storage.vercel_blob_sync.query_blobs",
+        lambda **kwargs: iter([]),
+    )
 
     client = TestClient(app)
     guest = client.post("/api/v1/auth/guest").json()
@@ -403,23 +411,34 @@ def test_direct_vercel_blob_multipart_upload_and_range_download_e2e(monkeypatch)
     )
     assert init_res.status_code == 201, init_res.text
     init_data = init_res.json()
-    assert init_data["upload_mode"] == "direct_blob"
+    assert init_data["upload_mode"] == "vercel_blob"
+    assert init_data["handle_upload_url"] == "/api/blob/upload"
+    assert init_data["upload_authorization_token"]
+    assert rw_token not in json_dump_safe(init_data)
     sid = init_data["session_id"]
 
-    part_url_res = client.get(f"/api/v1/uploads/{sid}/part-url/0", headers=headers)
-    assert part_url_res.status_code == 200
-    part_target = part_url_res.json()
-    assert part_target["upload_mode"] == "direct_blob"
-    assert part_target["method"] == "POST"
-    assert rw_token not in str(part_target)
-
-    reg_res = client.post(
-        f"/api/v1/uploads/{sid}/parts/0",
-        headers=headers,
-        json={"etag": '"etag-blob-part-1"', "size_bytes": len(sample_pdf)},
+    # Verify Next.js server-side handleUpload authorization callback (/authorize-blob)
+    auth_blob_res = client.post(
+        f"/api/v1/uploads/{sid}/authorize-blob",
+        json={
+            "pathname": init_data["storage_key"],
+            "upload_authorization_token": init_data["upload_authorization_token"],
+        },
     )
-    assert reg_res.status_code == 200
-    assert reg_res.json()["received_chunks"] == [0]
+    assert auth_blob_res.status_code == 200, auth_blob_res.text
+    auth_blob_data = auth_blob_res.json()
+    assert auth_blob_data["upload_id"] == sid
+    assert auth_blob_data["expected_size_bytes"] == len(sample_pdf)
+
+    # Rejects mismatched pathname
+    bad_path_res = client.post(
+        f"/api/v1/uploads/{sid}/authorize-blob",
+        json={
+            "pathname": "uploads/other/wrong.pdf",
+            "upload_authorization_token": init_data["upload_authorization_token"],
+        },
+    )
+    assert bad_path_res.status_code == 403
 
     finalize_upload_sync(sid)
 
@@ -443,12 +462,83 @@ def test_direct_vercel_blob_multipart_upload_and_range_download_e2e(monkeypatch)
     dl_path = orig_link_res.json()["download_url"]
     assert orig_link_res.json()["direct_storage"] is False
 
-    # Range download (first 8 bytes "%PDF-1.4")
+    # Range download (first 8 bytes "%PDF-1.4") via official SDK stream slicing
     range_dl = client.get(dl_path, headers={"Range": "bytes=0-7"})
     assert range_dl.status_code == 206
     assert range_dl.headers["accept-ranges"] == "bytes"
     assert range_dl.headers["content-range"] == f"bytes 0-7/{len(sample_pdf)}"
     assert range_dl.content == b"%PDF-1.4"
+
+
+def json_dump_safe(obj) -> str:
+    import json
+
+    return json.dumps(obj)
+
+
+def test_scheduled_retention_cron_and_restricted_upload_gating(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.config import get_settings
+    from app.main import app
+    from app.tasks import run_scheduled_retention_cleanup_sync
+
+    cfg = get_settings()
+    client = TestClient(app)
+
+    # 1. Verify worker scheduled retention cleanup runs independently of uploads
+    sched_res = run_scheduled_retention_cleanup_sync()
+    assert sched_res["status"] == "completed"
+    assert "cleaned" in sched_res
+    assert "storage_budget" in sched_res
+
+    # 2. Verify platform cron endpoint /api/v1/internal/cron/retention requires secret and executes cleanup
+    unauth_cron = client.get("/api/v1/internal/cron/retention")
+    assert unauth_cron.status_code == 401
+
+    monkeypatch.setattr(cfg, "CRON_SECRET", "cron-secret-test-999")
+    auth_cron = client.get(
+        "/api/v1/internal/cron/retention",
+        headers={"Authorization": "Bearer cron-secret-test-999"},
+    )
+    assert auth_cron.status_code == 200, auth_cron.text
+    assert auth_cron.json()["status"] == "completed"
+    assert auth_cron.json()["trigger"] == "scheduled_cron"
+
+    # 3. Verify RESTRICTED_SMOKE_TEST_MODE blocks public uploads unless valid X-Smoke-Test-Token is provided
+    guest = client.post("/api/v1/auth/guest").json()
+    headers = {"Authorization": f"Bearer {guest['access_token']}"}
+    monkeypatch.setattr(cfg, "RESTRICTED_SMOKE_TEST_MODE", True)
+    monkeypatch.setattr(cfg, "SMOKE_TEST_SECRET", "smoke-token-abc123")
+
+    blocked_res = client.post(
+        "/api/v1/uploads/init",
+        headers=headers,
+        json={"filename": "public.pdf", "expected_size_bytes": 1024},
+    )
+    assert blocked_res.status_code == 403
+    assert blocked_res.json()["detail"]["code"] == "RESTRICTED_SMOKE_TEST_MODE"
+
+    allowed_res = client.post(
+        "/api/v1/uploads/init",
+        headers={**headers, "X-Smoke-Test-Token": "smoke-token-abc123"},
+        json={"filename": "smoke.pdf", "expected_size_bytes": 1024},
+    )
+    assert allowed_res.status_code == 201, allowed_res.text
+
+    # 4. Verify REQUIRE_READINESS_FOR_UPLOADS blocks public uploads when readiness is not_ready
+    monkeypatch.setattr(cfg, "RESTRICTED_SMOKE_TEST_MODE", False)
+    monkeypatch.setattr(cfg, "REQUIRE_READINESS_FOR_UPLOADS", True)
+    monkeypatch.setattr(
+        "app.routers.admin.evaluate_readiness",
+        lambda: {"status": "not_ready", "ready": False, "dependencies": {}},
+    )
+    not_ready_res = client.post(
+        "/api/v1/uploads/init",
+        headers=headers,
+        json={"filename": "notready.pdf", "expected_size_bytes": 1024},
+    )
+    assert not_ready_res.status_code == 503
+    assert not_ready_res.json()["detail"]["code"] == "SYSTEM_NOT_READY_FOR_UPLOADS"
 
 
 def test_rediss_tls_enforces_cert_required():

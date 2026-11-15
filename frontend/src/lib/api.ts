@@ -1,3 +1,4 @@
+import { upload as vercelBlobUpload } from "@vercel/blob/client";
 import {
   CHUNK_SIZE_BYTES,
   ExportArtifactRecord,
@@ -180,7 +181,10 @@ export async function uploadFileInChunks(
   let effectiveChunkSize = CHUNK_SIZE_BYTES;
   let totalChunks = Math.max(1, Math.ceil(file.size / effectiveChunkSize));
   let receivedSet = new Set<number>();
-  let uploadMode: "proxy" | "direct_s3" | "direct_blob" = "proxy";
+  let uploadMode: "proxy" | "direct_s3" | "vercel_blob" = "proxy";
+  let storageKey = "";
+  let handleUploadUrl = "/api/blob/upload";
+  let uploadAuthorizationToken = "";
 
   if (sessionId) {
     const statusRes = await apiFetch<{
@@ -188,18 +192,27 @@ export async function uploadFileInChunks(
       chunk_size_bytes: number;
       total_chunks: number;
       received_chunks: number[];
-      upload_mode?: "proxy" | "direct_s3" | "direct_blob";
+      upload_mode?: "proxy" | "direct_s3" | "vercel_blob";
+      storage_key?: string;
+      handle_upload_url?: string;
+      upload_authorization_token?: string;
     }>(`/uploads/${sessionId}`);
     effectiveChunkSize = statusRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
     totalChunks = statusRes.total_chunks;
     receivedSet = new Set(statusRes.received_chunks);
     uploadMode = statusRes.upload_mode || "proxy";
+    storageKey = statusRes.storage_key || "";
+    handleUploadUrl = statusRes.handle_upload_url || "/api/blob/upload";
+    uploadAuthorizationToken = statusRes.upload_authorization_token || "";
   } else {
     const initRes = await apiFetch<{
       session_id: string;
       chunk_size_bytes: number;
       total_chunks: number;
-      upload_mode?: "proxy" | "direct_s3" | "direct_blob";
+      upload_mode?: "proxy" | "direct_s3" | "vercel_blob";
+      storage_key?: string;
+      handle_upload_url?: string;
+      upload_authorization_token?: string;
     }>("/uploads/init", {
       method: "POST",
       body: JSON.stringify({
@@ -212,73 +225,90 @@ export async function uploadFileInChunks(
     effectiveChunkSize = initRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
     totalChunks = initRes.total_chunks;
     uploadMode = initRes.upload_mode || "proxy";
+    storageKey = initRes.storage_key || "";
+    handleUploadUrl = initRes.handle_upload_url || "/api/blob/upload";
+    uploadAuthorizationToken = initRes.upload_authorization_token || "";
     callbacks.onSessionCreated?.(sessionId);
   }
 
-  for (let idx = 0; idx < totalChunks; idx++) {
-    if (callbacks.shouldCancel()) {
-      await apiFetch(`/uploads/${sessionId}`, { method: "DELETE" }).catch(() => {});
-      throw new Error("Upload cancelled");
+  if (uploadMode === "vercel_blob") {
+    if (!storageKey || !uploadAuthorizationToken) {
+      throw new Error("Missing Vercel Blob upload session authorization parameters.");
     }
-    if (callbacks.shouldPause()) {
-      await apiFetch(`/uploads/${sessionId}/pause`, { method: "POST" }).catch(() => {});
-      throw new Error("UPLOAD_PAUSED");
+    await vercelBlobUpload(storageKey, file, {
+      access: "private",
+      handleUploadUrl,
+      multipart: true,
+      clientPayload: JSON.stringify({
+        session_id: sessionId,
+        upload_authorization_token: uploadAuthorizationToken,
+      }),
+      onUploadProgress: ({ loaded, total, percentage }) => {
+        callbacks.onProgress(loaded, total || file.size, Math.round(percentage));
+      },
+    });
+  } else {
+    for (let idx = 0; idx < totalChunks; idx++) {
+      if (callbacks.shouldCancel()) {
+        await apiFetch(`/uploads/${sessionId}`, { method: "DELETE" }).catch(() => {});
+        throw new Error("Upload cancelled");
+      }
+      if (callbacks.shouldPause()) {
+        await apiFetch(`/uploads/${sessionId}/pause`, { method: "POST" }).catch(() => {});
+        throw new Error("UPLOAD_PAUSED");
+      }
+      if (receivedSet.has(idx)) {
+        const doneBytes = Math.min(file.size, (idx + 1) * effectiveChunkSize);
+        callbacks.onProgress(doneBytes, file.size, Math.round((doneBytes / file.size) * 100));
+        continue;
+      }
+
+      const start = idx * effectiveChunkSize;
+      const end = Math.min(file.size, start + effectiveChunkSize);
+      const slice = file.slice(start, end);
+
+      if (uploadMode === "direct_s3") {
+        const partUrlRes = await apiFetch<{
+          upload_url: string;
+          part_number: number;
+          method?: string;
+          headers?: Record<string, string>;
+        }>(`/uploads/${sessionId}/part-url/${idx}`);
+        const directRes = await fetch(partUrlRes.upload_url, {
+          method: partUrlRes.method || "PUT",
+          headers: partUrlRes.headers || undefined,
+          body: slice,
+        });
+        if (!directRes.ok) {
+          throw new Error(`Direct storage upload failed for chunk ${idx} (${directRes.status})`);
+        }
+        const etag = directRes.headers.get("ETag") || directRes.headers.get("etag") || "";
+        if (!etag) {
+          throw new Error(
+            `Direct storage response missing ETag for chunk ${idx}`
+          );
+        }
+        await apiFetch(`/uploads/${sessionId}/parts/${idx}`, {
+          method: "POST",
+          body: JSON.stringify({ etag, size_bytes: slice.size }),
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("chunk", slice, `part_${idx}`);
+
+        const res = await fetch(`${getApiBase()}/uploads/${sessionId}/chunk/${idx}`, {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData,
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.detail || `Chunk ${idx} upload failed`);
+        }
+      }
+
+      callbacks.onProgress(end, file.size, Math.round((end / file.size) * 100));
     }
-    if (receivedSet.has(idx)) {
-      const doneBytes = Math.min(file.size, (idx + 1) * effectiveChunkSize);
-      callbacks.onProgress(doneBytes, file.size, Math.round((doneBytes / file.size) * 100));
-      continue;
-    }
-
-    const start = idx * effectiveChunkSize;
-    const end = Math.min(file.size, start + effectiveChunkSize);
-    const slice = file.slice(start, end);
-
-    if (uploadMode === "direct_s3" || uploadMode === "direct_blob") {
-      const partUrlRes = await apiFetch<{
-        upload_url: string;
-        part_number: number;
-        method?: string;
-        headers?: Record<string, string>;
-      }>(`/uploads/${sessionId}/part-url/${idx}`);
-      const directRes = await fetch(partUrlRes.upload_url, {
-        method: partUrlRes.method || "PUT",
-        headers: partUrlRes.headers || undefined,
-        body: slice,
-      });
-      if (!directRes.ok) {
-        throw new Error(`Direct storage upload failed for chunk ${idx} (${directRes.status})`);
-      }
-      let etag = directRes.headers.get("ETag") || directRes.headers.get("etag") || "";
-      if (!etag && uploadMode === "direct_blob") {
-        const bodyJson = await directRes.json().catch(() => ({}));
-        etag = bodyJson.etag || bodyJson.ETag || "";
-      }
-      if (!etag) {
-        throw new Error(
-          `Direct storage response missing ETag for chunk ${idx}`
-        );
-      }
-      await apiFetch(`/uploads/${sessionId}/parts/${idx}`, {
-        method: "POST",
-        body: JSON.stringify({ etag, size_bytes: slice.size }),
-      });
-    } else {
-      const formData = new FormData();
-      formData.append("chunk", slice, `part_${idx}`);
-
-      const res = await fetch(`${getApiBase()}/uploads/${sessionId}/chunk/${idx}`, {
-        method: "PUT",
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
-      });
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({}));
-        throw new Error(errBody.detail || `Chunk ${idx} upload failed`);
-      }
-    }
-
-    callbacks.onProgress(end, file.size, Math.round((end / file.size) * 100));
   }
 
   let completed = await apiFetch<{

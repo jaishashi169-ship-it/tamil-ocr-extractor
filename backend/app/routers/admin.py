@@ -1,7 +1,9 @@
+import hmac
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, text
@@ -11,8 +13,14 @@ from app.auth import get_current_user, require_admin
 from app.config import get_settings
 from app.database import engine, get_db
 from app.dispatch import _redis_kwargs_for_url, is_broker_reachable
-from app.models import Job, SystemSetting, User
-from app.services.retention import cleanup_expired_resources, get_storage_budget_snapshot
+from app.models import Job, StorageReservation, SystemSetting, User
+from app.services.retention import (
+    cleanup_expired_resources,
+    commit_storage_reservation,
+    get_storage_budget_snapshot,
+    release_reservations_for_resource,
+    reserve_storage_capacity,
+)
 from app.services.tamil_utils import SUPPORTED_LEGACY_ENCODINGS
 from app.storage import storage
 
@@ -187,16 +195,27 @@ def get_api_readiness():
 @router.get("/capabilities")
 def get_capabilities():
     """Public capability matrix and installed OCR language packs."""
+    cfg = get_settings()
     ocr = _safe_ocr_status()
     return {
-        "app_name": settings.APP_NAME,
-        "max_upload_bytes": settings.MAX_UPLOAD_BYTES,
-        "upload_chunk_bytes": settings.UPLOAD_CHUNK_BYTES,
-        "user_storage_quota_bytes": settings.USER_STORAGE_QUOTA_BYTES,
-        "total_storage_budget_bytes": settings.TOTAL_STORAGE_BUDGET_BYTES,
-        "storage_backend": settings.STORAGE_BACKEND.lower(),
-        "max_batch_files": settings.MAX_BATCH_FILES,
-        "max_pdf_pages": settings.MAX_PDF_PAGES,
+        "app_name": cfg.APP_NAME,
+        "max_upload_bytes": cfg.MAX_UPLOAD_BYTES,
+        "upload_chunk_bytes": cfg.UPLOAD_CHUNK_BYTES,
+        "user_storage_quota_bytes": cfg.USER_STORAGE_QUOTA_BYTES,
+        "total_storage_budget_bytes": cfg.TOTAL_STORAGE_BUDGET_BYTES,
+        "storage_capacity_note": (
+            "Atomic reservations enforce total_storage_budget_bytes across concurrent uploads, originals, "
+            "page previews, exports, and temporary objects. On Hobby plans (850 MB safety budget within 1 GB cap), "
+            "a 500 MB upload plus generated previews and exports may exceed remaining capacity and is NOT guaranteed "
+            "to fit without prior cleanup or a larger storage plan."
+        ),
+        "upload_access_policy": {
+            "require_readiness_for_uploads": bool(cfg.REQUIRE_READINESS_FOR_UPLOADS),
+            "restricted_smoke_test_mode": bool(cfg.RESTRICTED_SMOKE_TEST_MODE),
+        },
+        "storage_backend": cfg.STORAGE_BACKEND.lower(),
+        "max_batch_files": cfg.MAX_BATCH_FILES,
+        "max_pdf_pages": cfg.MAX_PDF_PAGES,
         "installed_ocr_languages": ocr["languages"],
         "configured_ocr_languages": ocr.get("configured_languages", ocr["languages"]),
         "ocr_status": ocr,
@@ -216,6 +235,7 @@ def get_admin_overview(
     Administrator dashboard: job counts, processing duration, storage usage, worker health, capabilities.
     Never exposes user document contents.
     """
+    cfg = get_settings()
     status_counts = dict(db.query(Job.status, func.count(Job.id)).group_by(Job.status).all())
     avg_duration_ms = db.query(func.avg(Job.duration_ms)).filter(Job.duration_ms.isnot(None)).scalar()
     total_users = db.query(func.count(User.id)).scalar() or 0
@@ -231,18 +251,75 @@ def get_admin_overview(
         },
         "avg_processing_duration_ms": round(float(avg_duration_ms), 1) if avg_duration_ms else 0.0,
         "storage_usage_bytes": budget_snap["total_used_bytes"],
+        "storage_budget": budget_snap,
         "total_users": total_users,
         "worker_health": {
-            "status": "healthy",
+            "status": "healthy" if _safe_ocr_status().get("available") else "degraded",
             "isolated_network": True,
             "ocr_execution_mode": "local_or_worker" if _safe_ocr_languages() else "worker_daemon",
             "installed_ocr_languages": _safe_ocr_languages(),
         },
         "quotas": {
-            "max_upload_bytes": settings.MAX_UPLOAD_BYTES,
-            "default_retention_days": settings.DEFAULT_RETENTION_DAYS,
-            "user_storage_quota_bytes": settings.USER_STORAGE_QUOTA_BYTES,
-            "total_storage_budget_bytes": settings.TOTAL_STORAGE_BUDGET_BYTES,
+            "max_upload_bytes": cfg.MAX_UPLOAD_BYTES,
+            "default_retention_days": cfg.DEFAULT_RETENTION_DAYS,
+            "user_storage_quota_bytes": cfg.USER_STORAGE_QUOTA_BYTES,
+            "total_storage_budget_bytes": cfg.TOTAL_STORAGE_BUDGET_BYTES,
+        },
+    }
+
+
+@router.get("/admin/quotas")
+def get_admin_quotas(
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Detailed storage quota, active reservation breakdown, queue depth, and threshold monitoring."""
+    cfg = get_settings()
+    budget = get_storage_budget_snapshot(db)
+    eff_expr = func.coalesce(
+        func.nullif(StorageReservation.actual_bytes, 0),
+        StorageReservation.reserved_bytes,
+        0,
+    )
+    by_type_rows = (
+        db.query(
+            StorageReservation.resource_type,
+            StorageReservation.status,
+            func.count(StorageReservation.id),
+            func.coalesce(func.sum(eff_expr), 0),
+        )
+        .filter(StorageReservation.status.in_(["reserved", "committed"]))
+        .group_by(StorageReservation.resource_type, StorageReservation.status)
+        .all()
+    )
+    reservation_breakdown = [
+        {
+            "resource_type": r_type,
+            "status": r_status,
+            "count": int(cnt or 0),
+            "bytes": int(total_b or 0),
+        }
+        for r_type, r_status, cnt, total_b in by_type_rows
+    ]
+    used_pct = round(
+        (budget["total_used_bytes"] / max(1, budget["total_budget_bytes"])) * 100.0,
+        2,
+    )
+    queued_jobs = int(db.query(func.count(Job.id)).filter(Job.status == "queued").scalar() or 0)
+    running_jobs = int(db.query(func.count(Job.id)).filter(Job.status == "running").scalar() or 0)
+    return {
+        "storage_budget": budget,
+        "utilization_percent": used_pct,
+        "warning_level": "critical" if used_pct >= 90 else ("warning" if used_pct >= 75 else "normal"),
+        "reservation_breakdown": reservation_breakdown,
+        "queue_depth": {
+            "queued_jobs": queued_jobs,
+            "running_jobs": running_jobs,
+        },
+        "worker_heartbeat": _get_verified_worker_status(),
+        "upload_gating": {
+            "require_readiness_for_uploads": bool(cfg.REQUIRE_READINESS_FOR_UPLOADS),
+            "restricted_smoke_test_mode": bool(cfg.RESTRICTED_SMOKE_TEST_MODE),
         },
     }
 
@@ -256,6 +333,130 @@ def trigger_retention_cleanup(
     summary = cleanup_expired_resources(db)
     budget = get_storage_budget_snapshot(db)
     return {"cleaned": summary, "storage_budget": budget}
+
+
+@router.get("/internal/cron/retention")
+@router.post("/internal/cron/retention")
+def scheduled_cron_retention_cleanup(
+    authorization: Optional[str] = Header(default=None),
+    x_cron_secret: Optional[str] = Header(default=None, alias="X-Cron-Secret"),
+    db: Session = Depends(get_db),
+):
+    """
+    Platform-scheduled retention & expired-reservation cleanup endpoint (compatible with Vercel Cron).
+    Requires Authorization: Bearer <CRON_SECRET> or X-Cron-Secret header.
+    """
+    cfg = get_settings()
+    expected = (cfg.CRON_SECRET or cfg.SECRET_KEY or "").strip()
+    supplied = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    elif x_cron_secret:
+        supplied = x_cron_secret.strip()
+
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing cron authorization secret.",
+        )
+
+    summary = cleanup_expired_resources(db)
+    budget = get_storage_budget_snapshot(db)
+    return {
+        "status": "completed",
+        "trigger": "scheduled_cron",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cleaned": summary,
+        "storage_budget": budget,
+    }
+
+
+@router.post("/admin/smoke-test")
+def run_restricted_production_smoke_test(
+    x_smoke_test_token: Optional[str] = Header(default=None, alias="X-Smoke-Test-Token"),
+    db: Session = Depends(get_db),
+):
+    """
+    Restricted production smoke test endpoint.
+    Authorized via X-Smoke-Test-Token matching SMOKE_TEST_SECRET (or SECRET_KEY when SMOKE_TEST_SECRET is unset).
+    Verifies readiness, atomic storage reservation + object write/read/delete round-trip, and worker status
+    while keeping public uploads blocked when RESTRICTED_SMOKE_TEST_MODE=true or REQUIRE_READINESS_FOR_UPLOADS=true.
+    """
+    cfg = get_settings()
+    expected = (cfg.SMOKE_TEST_SECRET or cfg.SECRET_KEY or "").strip()
+    supplied = (x_smoke_test_token or "").strip()
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Valid X-Smoke-Test-Token header is required for restricted production smoke test.",
+        )
+
+    readiness = evaluate_readiness()
+    probe_id = f"smoke-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    probe_key = f"smoke-tests/{probe_id}.txt"
+    probe_payload = b"Tamil-English Document Studio Smoke Probe: \xe0\xae\xa4\xe0\xae\xae\xe0\xae\xbf\xe0\xae\xb4\xe0\xaf\x8d + English"
+    storage_roundtrip_ok = False
+    storage_error: Optional[str] = None
+
+    smoke_user = db.query(User).first()
+    if smoke_user is None:
+        smoke_user = User(
+            email="smoke-probe@studio.local",
+            hashed_password="x",
+            role="admin",
+            storage_quota_bytes=cfg.USER_STORAGE_QUOTA_BYTES,
+            retention_days=1,
+        )
+        db.add(smoke_user)
+        db.commit()
+        db.refresh(smoke_user)
+
+    try:
+        reserve_storage_capacity(
+            db,
+            user=smoke_user,
+            resource_type="temp_object",
+            resource_id=probe_id,
+            reserved_bytes=len(probe_payload),
+            storage_key=probe_key,
+            ttl_seconds=300,
+        )
+        storage.save_bytes(probe_key, probe_payload, content_type="text/plain; charset=utf-8")
+        commit_storage_reservation(
+            db,
+            user_id=smoke_user.id,
+            resource_type="temp_object",
+            resource_id=probe_id,
+            actual_bytes=len(probe_payload),
+            storage_key=probe_key,
+        )
+        downloaded = storage.read_bytes(probe_key)
+        storage_roundtrip_ok = downloaded == probe_payload
+    except Exception as exc:
+        storage_error = str(exc)
+    finally:
+        try:
+            storage.delete_key(probe_key)
+        except Exception:
+            pass
+        try:
+            release_reservations_for_resource(
+                db, resource_type="temp_object", resource_id=probe_id
+            )
+        except Exception:
+            pass
+
+    budget = get_storage_budget_snapshot(db)
+    return {
+        "smoke_test_passed": bool(readiness["ready"] and storage_roundtrip_ok),
+        "storage_roundtrip_ok": storage_roundtrip_ok,
+        "storage_error": storage_error,
+        "readiness": readiness,
+        "storage_budget": budget,
+        "public_uploads_blocked": bool(
+            cfg.RESTRICTED_SMOKE_TEST_MODE or (cfg.REQUIRE_READINESS_FOR_UPLOADS and not readiness["ready"])
+        ),
+    }
 
 
 @router.put("/admin/quotas")
