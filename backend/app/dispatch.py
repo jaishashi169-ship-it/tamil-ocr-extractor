@@ -1,6 +1,7 @@
 import socket
 from urllib.parse import urlparse
 from typing import Any, Callable, Dict, List, Optional
+import certifi
 from fastapi import BackgroundTasks, HTTPException, status
 
 from app.celery_app import celery_app
@@ -8,10 +9,14 @@ from app.config import get_settings
 
 
 def _redis_kwargs_for_url(url: str, connect_timeout: float = 0.5, socket_timeout: float = 2.0) -> Dict[str, Any]:
-    return {
+    kwargs: Dict[str, Any] = {
         "socket_connect_timeout": connect_timeout,
         "socket_timeout": socket_timeout,
     }
+    if (url or "").strip().lower().startswith("rediss://"):
+        kwargs["ssl_cert_reqs"] = "required"
+        kwargs["ssl_ca_certs"] = certifi.where()
+    return kwargs
 
 
 def is_broker_reachable(broker_url: str, connect_timeout: float = 0.5, socket_timeout: float = 1.0) -> bool:

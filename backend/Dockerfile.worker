@@ -28,9 +28,9 @@ COPY . /app
 RUN mkdir -p /data/private_storage && useradd -m -u 10001 appuser && chown -R appuser:appuser /app /data/private_storage
 USER appuser
 
-# Verify Tesseract (tam + eng), LibreOffice, registered Celery tasks, and real bilingual Tamil-English OCR inside the worker image
+# Verify Tesseract (tam + eng), LibreOffice, registered Celery tasks, and bilingual OCR execution smoke test with transcript accuracy
 RUN tesseract --list-langs && \
     soffice --version && \
-    python -c "import json; from app.tasks import collect_worker_runtime_status; s = collect_worker_runtime_status(True); print('WORKER_RUNTIME_VERIFIED:', json.dumps(s, ensure_ascii=False)); assert s['available'] and s['tamil_unicode_verified'], s"
+    python -c "import json; from app.tasks import collect_worker_runtime_status; s = collect_worker_runtime_status(True); print('WORKER_OCR_SMOKE_TEST:', json.dumps(s, ensure_ascii=False)); assert s['available'] and s['tamil_accuracy'] >= 0.85 and s['english_accuracy'] >= 0.85, s"
 
 CMD ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2"]

@@ -472,8 +472,24 @@ WORKER_STATUS_REDIS_KEY = "doc_studio:worker:status"
 _cached_worker_ocr_probe: Optional[Dict[str, Any]] = None
 
 
+def _normalized_similarity(actual: str, expected: str) -> float:
+    import difflib
+    import unicodedata
+
+    def _clean(val: str) -> str:
+        norm = unicodedata.normalize("NFC", val or "")
+        return "".join(ch for ch in norm if not ch.isspace() and ch not in ("\u200c", "\u200d")).upper()
+
+    a, b = _clean(actual), _clean(expected)
+    if not b:
+        return 1.0
+    if not a:
+        return 0.0
+    return round(difflib.SequenceMatcher(None, a, b).ratio(), 4)
+
+
 def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]:
-    """Run inside the Celery worker to verify Tesseract languages, registered tasks, and real bilingual Tamil-English OCR."""
+    """Run inside the Celery worker to execute an OCR execution smoke test and measure Tamil/English transcript accuracy."""
     global _cached_worker_ocr_probe
     if _cached_worker_ocr_probe is None or force_reprobe:
         import tempfile
@@ -482,16 +498,23 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
 
         ocr_info = get_ocr_status()
         langs = ocr_info.get("languages", [])
-        bilingual_smoke_passed = False
-        tamil_unicode_detected = False
+        expected_tamil = "தமிழ் ஆவணம்"
+        expected_english = "TAMIL OCR STUDIO 2026"
         smoke_sample = ""
+        extracted_tamil_line = ""
+        extracted_english_line = ""
+        tamil_accuracy = 0.0
+        english_accuracy = 0.0
+        smoke_passed = False
+
         if ocr_info.get("available") and "eng" in langs:
             try:
                 with tempfile.TemporaryDirectory() as tmpdir:
                     img_path = Path(tmpdir) / "bilingual_smoke.png"
-                    img = Image.new("RGB", (900, 220), color=(255, 255, 255))
+                    img = Image.new("RGB", (960, 240), color=(255, 255, 255))
                     draw = ImageDraw.Draw(img)
                     tamil_font = None
+                    latin_font = None
                     for candidate in (
                         "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
                         "/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
@@ -501,11 +524,22 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
                         if Path(candidate).exists():
                             tamil_font = ImageFont.truetype(candidate, 36)
                             break
+                    for candidate in (
+                        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                        "C:/Windows/Fonts/arial.ttf",
+                        "C:/Windows/Fonts/Nirmala.ttf",
+                    ):
+                        if Path(candidate).exists():
+                            latin_font = ImageFont.truetype(candidate, 36)
+                            break
+
                     if tamil_font is not None and "tam" in langs:
-                        draw.text((30, 30), "தமிழ் ஆவணம்", fill=(0, 0, 0), font=tamil_font)
-                        draw.text((30, 110), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0), font=tamil_font)
+                        draw.text((32, 32), expected_tamil, fill=(0, 0, 0), font=tamil_font)
+                        draw.text((32, 128), expected_english, fill=(0, 0, 0), font=latin_font)
                     else:
-                        draw.text((30, 70), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0))
+                        draw.text((32, 80), expected_english, fill=(0, 0, 0), font=latin_font)
+
                     img.save(img_path, format="PNG")
                     blocks, _conf, _warns = run_ocr_on_image(
                         img_path,
@@ -513,23 +547,37 @@ def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]
                         1,
                         OCROptions(language="tam+eng" if "tam" in langs else "eng"),
                     )
-                    smoke_sample = " ".join(b.text for b in blocks).strip()
-                    tamil_unicode_detected = any("\u0B80" <= ch <= "\u0BFF" for ch in smoke_sample)
-                    bilingual_smoke_passed = (
-                        ("OCR" in smoke_sample.upper() or "TAMIL" in smoke_sample.upper() or "2026" in smoke_sample)
-                        and (tamil_unicode_detected or tamil_font is None)
+                    smoke_sample = " | ".join(b.text.strip() for b in blocks if b.text.strip())
+                    full_text = " ".join(b.text.strip() for b in blocks if b.text.strip())
+                    extracted_tamil_line = "".join(
+                        ch for ch in full_text if ("\u0B80" <= ch <= "\u0BFF") or ch.isspace()
+                    ).strip()
+                    extracted_english_line = "".join(
+                        ch for ch in full_text if ch.isascii() and (ch.isalnum() or ch.isspace())
+                    ).strip()
+                    tamil_accuracy = _normalized_similarity(extracted_tamil_line, expected_tamil)
+                    english_accuracy = _normalized_similarity(extracted_english_line, expected_english)
+                    smoke_passed = bool(
+                        english_accuracy >= 0.85
+                        and (tamil_accuracy >= 0.85 or tamil_font is None or "tam" not in langs)
                     )
             except Exception as exc:
                 smoke_sample = f"error: {exc}"
-                bilingual_smoke_passed = False
+                smoke_passed = False
 
         registered = sorted(t for t in celery_app.tasks.keys() if t.startswith("app.tasks."))
         _cached_worker_ocr_probe = {
-            "available": bool(ocr_info.get("available") and "tam" in langs and "eng" in langs and bilingual_smoke_passed),
+            "verification_type": "ocr_execution_smoke_test",
+            "available": bool(ocr_info.get("available") and "tam" in langs and "eng" in langs and smoke_passed),
             "tesseract_available": bool(ocr_info.get("available")),
             "languages": langs,
-            "bilingual_ocr_verified": bilingual_smoke_passed,
-            "tamil_unicode_verified": tamil_unicode_detected,
+            "smoke_test_passed": smoke_passed,
+            "reference_tamil": expected_tamil,
+            "extracted_tamil": extracted_tamil_line,
+            "tamil_accuracy": tamil_accuracy,
+            "reference_english": expected_english,
+            "extracted_english": extracted_english_line,
+            "english_accuracy": english_accuracy,
             "smoke_sample": smoke_sample,
             "registered_tasks": registered,
         }

@@ -108,3 +108,22 @@ def test_production_safety_rejects_sqlite_and_local_storage():
             SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
             STORAGE_BACKEND="local",
         ).validate_production_safety()
+
+
+def test_rediss_tls_enforces_cert_required():
+    import ssl
+    import certifi
+    from app.celery_app import build_celery_ssl_options
+    from app.dispatch import _redis_kwargs_for_url
+
+    assert build_celery_ssl_options("redis://localhost:6379/0") is None
+    tls_opts = build_celery_ssl_options("rediss://default:secret@redis.cloud.example:6379/0")
+    assert tls_opts is not None
+    assert tls_opts["ssl_cert_reqs"] == ssl.CERT_REQUIRED
+    assert tls_opts["ssl_ca_certs"] == certifi.where()
+
+    plain_kw = _redis_kwargs_for_url("redis://localhost:6379/0")
+    assert "ssl_cert_reqs" not in plain_kw
+    tls_kw = _redis_kwargs_for_url("rediss://default:secret@redis.cloud.example:6379/0")
+    assert tls_kw["ssl_cert_reqs"] == "required"
+    assert tls_kw["ssl_ca_certs"] == certifi.where()

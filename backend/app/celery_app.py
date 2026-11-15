@@ -1,7 +1,20 @@
+import ssl
+import certifi
 from celery import Celery
 from app.config import get_settings
 
 settings = get_settings()
+
+
+def build_celery_ssl_options(url: str) -> dict | None:
+    """Return strict TLS verification options (CERT_REQUIRED + certifi CA bundle) for rediss:// URLs."""
+    if (url or "").strip().lower().startswith("rediss://"):
+        return {
+            "ssl_cert_reqs": ssl.CERT_REQUIRED,
+            "ssl_ca_certs": certifi.where(),
+        }
+    return None
+
 
 celery_app = Celery(
     "tamil_doc_studio",
@@ -32,4 +45,6 @@ celery_app.conf.update(
     },
     redis_socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
     redis_socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    broker_use_ssl=build_celery_ssl_options(settings.CELERY_BROKER_URL),
+    redis_backend_use_ssl=build_celery_ssl_options(settings.CELERY_RESULT_BACKEND),
 )
