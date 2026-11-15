@@ -71,7 +71,9 @@ export function StudyStudioClient() {
         setJobs(completed);
         if (!selectedJobId && completed.length > 0) setSelectedJobId(completed[0].job_id);
       })
-      .catch(() => {});
+      .catch((err) => {
+        setStudyError(err instanceof Error ? err.message : "Backend API is currently unavailable.");
+      });
 
     listStudyProjects()
       .then((res) => {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { formatBytes, resolveApiBase, uploadFileInChunks } from "./api";
+import { clearStoredToken, ensureAuthToken, formatBytes, resolveApiBase, setStoredToken, uploadFileInChunks } from "./api";
 import { MAX_UPLOAD_BYTES } from "./types";
 
 const noopCallbacks = {
@@ -31,11 +31,49 @@ describe("Frontend API & chunked upload behavior", () => {
     expect(formatBytes(500_000_000)).toBe("500.0 MB");
   });
 
-  it("normalizes NEXT_PUBLIC_API_URL without duplicating /api/v1 and fails clearly in production when missing", () => {
-    expect(resolveApiBase("https://api.example.com", "app.vercel.app")).toBe("https://api.example.com/api/v1");
-    expect(resolveApiBase("https://api.example.com/api/v1/", "app.vercel.app")).toBe("https://api.example.com/api/v1");
+  it("normalizes NEXT_PUBLIC_API_URL without duplicating /api/v1 and rejects missing or placeholder URLs in production", () => {
+    expect(resolveApiBase("https://api.tamilstudio.app", "app.vercel.app")).toBe("https://api.tamilstudio.app/api/v1");
+    expect(resolveApiBase("https://api.tamilstudio.app/api/v1/", "app.vercel.app")).toBe(
+      "https://api.tamilstudio.app/api/v1"
+    );
     expect(resolveApiBase(undefined, "localhost")).toBe("http://localhost:8000/api/v1");
     expect(() => resolveApiBase(undefined, "app.vercel.app")).toThrow("NEXT_PUBLIC_API_URL is not configured");
+    expect(() => resolveApiBase("https://api.example.com/api/v1", "app.vercel.app")).toThrow("placeholder");
+    expect(() => resolveApiBase("http://api.tamilstudio.app/api/v1", "app.vercel.app")).toThrow("HTTPS");
+  });
+
+  it("deduplicates concurrent auth requests, clears on failure, and ignores stale results after logout", async () => {
+    clearStoredToken();
+    vi.stubGlobal("window", { location: { hostname: "localhost" } });
+
+    let resolveFetch!: (val: Response) => void;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p1 = ensureAuthToken();
+    const p2 = ensureAuthToken();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Simulate logout/session change while request is in flight
+    clearStoredToken();
+    resolveFetch(new Response(JSON.stringify({ access_token: "stale-token" }), { status: 200 }));
+    await expect(p1).rejects.toThrow("Session changed");
+    await expect(p2).rejects.toThrow("Session changed");
+    expect(localStorage.getItem("teds_access_token")).toBeNull();
+
+    // Next attempt after failure/clear should issue a fresh request
+    const fetchFresh = vi.fn(async () => new Response(JSON.stringify({ access_token: "fresh-token" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchFresh);
+    const tok = await ensureAuthToken();
+    expect(tok).toBe("fresh-token");
+    expect(fetchFresh).toHaveBeenCalledTimes(1);
+    setStoredToken("manual-token");
+    expect(await ensureAuthToken()).toBe("manual-token");
   });
 
   it("rejects files exceeding 500,000,000 bytes before initializing upload", async () => {

@@ -9,15 +9,42 @@ import {
   StudyProjectRecord,
 } from "./types";
 
+const PLACEHOLDER_HOSTS = [
+  "example.com",
+  "example.org",
+  "example.net",
+  ".example",
+  "your-domain",
+  "placeholder",
+  "localhost",
+  "127.0.0.1",
+];
+
 export function resolveApiBase(
   envUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL,
   hostname: string | undefined = typeof window !== "undefined" ? window.location.hostname : "localhost"
 ): string {
+  const isLocalHost = !hostname || hostname === "localhost" || hostname === "127.0.0.1";
   const trimmed = (envUrl || "").trim().replace(/\/+$/, "");
   if (trimmed) {
+    if (!isLocalHost) {
+      let parsed: URL;
+      try {
+        parsed = new URL(trimmed);
+      } catch {
+        throw new Error(`NEXT_PUBLIC_API_URL is not a valid URL: "${trimmed}"`);
+      }
+      if (parsed.protocol !== "https:") {
+        throw new Error("NEXT_PUBLIC_API_URL must use HTTPS in production.");
+      }
+      const apiHost = parsed.hostname.toLowerCase();
+      if (PLACEHOLDER_HOSTS.some((p) => apiHost === p || apiHost.includes(p))) {
+        throw new Error(`NEXT_PUBLIC_API_URL cannot use a placeholder or local host ("${apiHost}") in production.`);
+      }
+    }
     return trimmed.endsWith("/api/v1") ? trimmed : `${trimmed}/api/v1`;
   }
-  if (!hostname || hostname === "localhost" || hostname === "127.0.0.1") {
+  if (isLocalHost) {
     return "http://localhost:8000/api/v1";
   }
   throw new Error(
@@ -30,6 +57,9 @@ function getApiBase(): string {
 }
 
 const TOKEN_STORAGE_KEY = "teds_access_token";
+let authEpoch = 0;
+let inFlightAuthPromise: Promise<string> | null = null;
+let inFlightAuthEpoch = -1;
 
 export function getStoredToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -38,21 +68,55 @@ export function getStoredToken(): string | null {
 
 export function setStoredToken(token: string): void {
   if (typeof window !== "undefined") {
+    authEpoch += 1;
+    inFlightAuthPromise = null;
+    inFlightAuthEpoch = -1;
     localStorage.setItem(TOKEN_STORAGE_KEY, token);
   }
 }
 
+export function clearStoredToken(): void {
+  if (typeof window !== "undefined") {
+    authEpoch += 1;
+    inFlightAuthPromise = null;
+    inFlightAuthEpoch = -1;
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+  }
+}
+
 export async function ensureAuthToken(): Promise<string> {
+  if (typeof window === "undefined") {
+    throw new Error("Authentication is only available in the browser.");
+  }
+
   const existing = getStoredToken();
   if (existing) return existing;
 
-  const res = await fetch(`${getApiBase()}/auth/guest`, { method: "POST" });
-  if (!res.ok) {
-    throw new Error("Unable to initialize studio session.");
+  if (!inFlightAuthPromise || inFlightAuthEpoch !== authEpoch) {
+    const requestEpoch = authEpoch;
+    inFlightAuthEpoch = requestEpoch;
+    inFlightAuthPromise = (async () => {
+      const res = await fetch(`${getApiBase()}/auth/guest`, { method: "POST" });
+      if (!res.ok) {
+        throw new Error("Unable to initialize studio session.");
+      }
+      const data = await res.json();
+      const token = data.access_token as string;
+      if (authEpoch === requestEpoch) {
+        localStorage.setItem(TOKEN_STORAGE_KEY, token);
+        return token;
+      }
+      const current = getStoredToken();
+      if (current) return current;
+      throw new Error("Session changed while authenticating.");
+    })().finally(() => {
+      if (inFlightAuthEpoch === requestEpoch) {
+        inFlightAuthPromise = null;
+        inFlightAuthEpoch = -1;
+      }
+    });
   }
-  const data = await res.json();
-  setStoredToken(data.access_token);
-  return data.access_token;
+  return inFlightAuthPromise;
 }
 
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -66,7 +130,7 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const apiBase = getApiBase();
   const res = await fetch(`${apiBase}${path}`, { ...init, headers });
   if (res.status === 401 && typeof window !== "undefined") {
-    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    clearStoredToken();
     const freshToken = await ensureAuthToken();
     headers.set("Authorization", `Bearer ${freshToken}`);
     const retry = await fetch(`${apiBase}${path}`, { ...init, headers });

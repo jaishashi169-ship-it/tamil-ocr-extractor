@@ -1,0 +1,16 @@
+# Exclude non-frontend directories and large local artifacts from Vercel deployments
+backend/
+docs/
+private_storage/
+samples/
+scripts/
+docker-compose.yml
+*.zip
+*.db
+*.sqlite*
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+frontend/.next/
+frontend/node_modules/

@@ -63,13 +63,19 @@ export default function HomePage() {
   const [latestArtifact, setLatestArtifact] = useState<ExportArtifactRecord | null>(null);
   const [recentJobs, setRecentJobs] = useState<JobRecord[]>([]);
   const [promptPassword, setPromptPassword] = useState("");
+  const [backendError, setBackendError] = useState<string | null>(null);
 
   const refreshRecent = async () => {
     try {
       const res = await listJobs(1, 15);
       setRecentJobs(res.items);
-    } catch {
-      // Backend may not be running during static build/preview
+      setBackendError(null);
+    } catch (err) {
+      setBackendError(
+        err instanceof Error
+          ? err.message
+          : "Backend API is currently unavailable. Please verify NEXT_PUBLIC_API_URL and backend health."
+      );
     }
   };
 
@@ -259,6 +265,15 @@ export default function HomePage() {
         </h1>
         <p className="mt-2 text-base text-slate-600 dark:text-slate-300">{t(locale, "heroSubtitle")}</p>
       </div>
+
+      {backendError && (
+        <div
+          role="alert"
+          className="mx-auto max-w-3xl rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+        >
+          <strong>Backend Unavailable:</strong> {backendError}
+        </div>
+      )}
 
       {/* 4-Step Guided Progress Bar */}
       <nav aria-label="Workflow steps" className="mx-auto flex max-w-2xl items-center justify-between">

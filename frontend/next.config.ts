@@ -1,7 +1,42 @@
 import type { NextConfig } from "next";
 
+const PLACEHOLDER_API_PATTERNS = [
+  "example.com",
+  "example.org",
+  "example.net",
+  ".example",
+  "your-domain",
+  "placeholder",
+  "localhost",
+  "127.0.0.1",
+];
+
+if (process.env.VERCEL === "1") {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.trim() || "";
+  if (!apiUrl) {
+    throw new Error(
+      "NEXT_PUBLIC_API_URL must be set to your HTTPS backend API URL (including /api/v1) before building on Vercel."
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(apiUrl);
+  } catch {
+    throw new Error(`NEXT_PUBLIC_API_URL is not a valid URL: "${apiUrl}"`);
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error("NEXT_PUBLIC_API_URL must use HTTPS for Vercel deployments.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (PLACEHOLDER_API_PATTERNS.some((p) => host === p || host.includes(p))) {
+    throw new Error(
+      `NEXT_PUBLIC_API_URL cannot use a placeholder or local host ("${host}") on Vercel.`
+    );
+  }
+}
+
 const nextConfig: NextConfig = {
-  output: "standalone",
+  ...(process.env.VERCEL === "1" ? {} : { output: "standalone" }),
 };
 
 export default nextConfig;

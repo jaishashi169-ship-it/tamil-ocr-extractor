@@ -8,6 +8,7 @@ import { useStudio } from "@/components/StudioContext";
 
 export default function AdminPage() {
   const { locale } = useStudio();
+  const [backendError, setBackendError] = useState<string | null>(null);
   const [caps, setCaps] = useState<{
     max_upload_bytes: number;
     installed_ocr_languages: string[];
@@ -16,7 +17,14 @@ export default function AdminPage() {
   } | null>(null);
 
   useEffect(() => {
-    getCapabilities().then(setCaps).catch(() => {});
+    getCapabilities()
+      .then((data) => {
+        setCaps(data);
+        setBackendError(null);
+      })
+      .catch((err) => {
+        setBackendError(err instanceof Error ? err.message : "Backend API is currently unavailable.");
+      });
   }, []);
 
   return (
@@ -27,6 +35,15 @@ export default function AdminPage() {
           System capabilities, installed OCR language packs, and privacy-preserving operational limits.
         </p>
       </div>
+
+      {backendError && (
+        <div
+          role="alert"
+          className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+        >
+          <strong>Backend Unavailable:</strong> {backendError}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
