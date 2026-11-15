@@ -25,8 +25,9 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     get_settings().validate_production_safety()
-    # Ensure tables exist in local/SQLite dev mode (PostgreSQL uses Alembic in Docker)
-    Base.metadata.create_all(bind=engine)
+    # Ensure tables exist in local/SQLite dev mode (PostgreSQL uses Alembic in production)
+    if str(engine.url.drivername).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")

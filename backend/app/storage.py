@@ -17,7 +17,12 @@ class PrivateStorage:
     def __init__(self) -> None:
         self.backend = settings.STORAGE_BACKEND.lower()
         self.local_root = Path(settings.LOCAL_STORAGE_ROOT).resolve()
-        self.local_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.local_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            import tempfile
+            self.local_root = (Path(tempfile.gettempdir()) / "private_storage").resolve()
+            self.local_root.mkdir(parents=True, exist_ok=True)
         self._s3 = None
         self._s3_public = None
         if self.backend == "s3":
@@ -45,7 +50,10 @@ class PrivateStorage:
             try:
                 self._s3.head_bucket(Bucket=settings.S3_BUCKET_NAME)
             except Exception:
-                self._s3.create_bucket(Bucket=settings.S3_BUCKET_NAME)
+                try:
+                    self._s3.create_bucket(Bucket=settings.S3_BUCKET_NAME)
+                except Exception:
+                    pass
 
     def is_s3(self) -> bool:
         return self.backend == "s3" and self._s3 is not None
