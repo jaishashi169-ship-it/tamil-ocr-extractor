@@ -1,42 +1,163 @@
-from typing import Any, Dict
+import json
+import os
+from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
 from app.config import get_settings
-from app.database import get_db
+from app.database import engine, get_db
+from app.dispatch import _redis_kwargs_for_url, is_broker_reachable
 from app.models import Job, SystemSetting, User
 from app.services.tamil_utils import SUPPORTED_LEGACY_ENCODINGS
 from app.storage import storage
 
+WORKER_STATUS_REDIS_KEY = "doc_studio:worker:status"
+
+
+def _get_verified_worker_status() -> Optional[Dict[str, Any]]:
+    cfg = get_settings()
+    broker_url = cfg.CELERY_BROKER_URL or ""
+    if os.environ.get("VERCEL") and ("localhost" in broker_url or "127.0.0.1" in broker_url):
+        return None
+    if not is_broker_reachable(broker_url, cfg.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, cfg.REDIS_SOCKET_TIMEOUT_SECONDS):
+        return None
+    try:
+        import redis
+
+        client = redis.from_url(
+            broker_url,
+            **_redis_kwargs_for_url(
+                broker_url,
+                cfg.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+                cfg.REDIS_SOCKET_TIMEOUT_SECONDS,
+            ),
+        )
+        raw = client.get(WORKER_STATUS_REDIS_KEY)
+        if not raw:
+            return None
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
 
 def _safe_ocr_status() -> Dict[str, Any]:
-    try:
-        from app.services.ocr_engine import get_ocr_status
-
-        status_info = get_ocr_status()
-        status_info["execution_mode"] = "local_or_worker"
-        status_info["verified_locally"] = True
-        return status_info
-    except ImportError:
+    worker_status = _get_verified_worker_status()
+    if worker_status and worker_status.get("available"):
         return {
             "available": True,
+            "status": "verified_worker",
             "execution_mode": "worker_daemon",
             "verified_locally": False,
+            "verified_worker": True,
             "configured_languages": ["eng", "tam"],
-            "languages": [],
+            "languages": worker_status.get("languages", []),
+            "registered_tasks": worker_status.get("registered_tasks", []),
+            "updated_at": worker_status.get("updated_at"),
         }
+
+    if not os.environ.get("VERCEL"):
+        try:
+            from app.services.ocr_engine import get_ocr_status
+
+            status_info = get_ocr_status()
+            is_avail = bool(status_info.get("available"))
+            status_info["status"] = "verified_local" if is_avail else "configured_but_unverified"
+            status_info["execution_mode"] = "local_or_worker"
+            status_info["verified_locally"] = is_avail
+            status_info["verified_worker"] = False
+            status_info["configured_languages"] = ["eng", "tam"]
+            return status_info
+        except ImportError:
+            pass
+
+    return {
+        "available": False,
+        "status": "configured_but_unverified",
+        "execution_mode": "worker_daemon",
+        "verified_locally": False,
+        "verified_worker": False,
+        "configured_languages": ["eng", "tam"],
+        "languages": [],
+    }
 
 
 def _safe_ocr_languages() -> list[str]:
-    try:
-        from app.services.ocr_engine import get_installed_tesseract_languages
+    return _safe_ocr_status().get("languages", [])
 
-        return get_installed_tesseract_languages()
-    except ImportError:
-        return []
+
+def evaluate_readiness() -> Dict[str, Any]:
+    cfg = get_settings()
+    is_serverless_or_prod = cfg.APP_ENV == "production" or bool(os.environ.get("VERCEL"))
+
+    # 1. Database check
+    if is_serverless_or_prod and cfg.SYNC_DATABASE_URL.startswith("sqlite"):
+        db_status: Dict[str, Any] = {
+            "ready": False,
+            "driver": "sqlite",
+            "reason": "Managed PostgreSQL is required; SQLite or /tmp database is not permitted on Vercel/production.",
+        }
+    else:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            db_status = {"ready": True, "driver": str(engine.url.drivername)}
+        except Exception as exc:
+            db_status = {"ready": False, "driver": str(engine.url.drivername), "reason": str(exc)}
+
+    # 2. Broker check
+    broker_url = cfg.CELERY_BROKER_URL or ""
+    if is_serverless_or_prod and ("localhost" in broker_url or "127.0.0.1" in broker_url):
+        broker_status: Dict[str, Any] = {
+            "ready": False,
+            "reason": "Managed Redis broker is required; CELERY_BROKER_URL points to localhost.",
+        }
+    elif is_broker_reachable(broker_url, cfg.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, cfg.REDIS_SOCKET_TIMEOUT_SECONDS):
+        broker_status = {"ready": True}
+    else:
+        broker_status = {
+            "ready": False,
+            "fallback_enabled": bool(cfg.ALLOW_BACKGROUND_TASK_FALLBACK and not is_serverless_or_prod),
+            "reason": "Redis broker unreachable.",
+        }
+
+    # 3. Durable storage check
+    storage_status = storage.check_readiness()
+
+    # 4. Worker & OCR verification check
+    ocr = _safe_ocr_status()
+    worker_ready = bool(ocr.get("available"))
+    worker_status_report: Dict[str, Any] = {
+        "ready": worker_ready,
+        "status": ocr.get("status", "configured_but_unverified"),
+        "execution_mode": ocr.get("execution_mode", "worker_daemon"),
+        "verified_worker": bool(ocr.get("verified_worker")),
+        "verified_locally": bool(ocr.get("verified_locally")),
+        "languages": ocr.get("languages", []),
+        "configured_languages": ocr.get("configured_languages", ["eng", "tam"]),
+    }
+    if not worker_ready:
+        worker_status_report["reason"] = "No reachable worker with verified Tesseract (tam+eng) heartbeat."
+
+    broker_ok = broker_status["ready"] or bool(broker_status.get("fallback_enabled"))
+    overall_ready = bool(db_status["ready"] and broker_ok and storage_status["ready"] and worker_ready)
+    return {
+        "status": "ready" if overall_ready else "not_ready",
+        "ready": overall_ready,
+        "environment": cfg.APP_ENV,
+        "dependencies": {
+            "database": db_status,
+            "broker": broker_status,
+            "storage": storage_status,
+            "worker": worker_status_report,
+        },
+    }
 
 router = APIRouter(tags=["Capabilities & Administration"])
 settings = get_settings()
@@ -46,6 +167,13 @@ class UpdateQuotasRequest(BaseModel):
     max_upload_bytes: int = Field(default=settings.MAX_UPLOAD_BYTES, ge=1_000_000, le=500_000_000)
     default_retention_days: int = Field(default=settings.DEFAULT_RETENTION_DAYS, ge=1, le=365)
     user_storage_quota_bytes: int = Field(default=settings.USER_STORAGE_QUOTA_BYTES, ge=50_000_000)
+
+
+@router.get("/health/ready")
+def get_api_readiness():
+    """Readiness probe reporting database, broker, storage, and verified OCR worker status."""
+    report = evaluate_readiness()
+    return JSONResponse(status_code=200 if report["ready"] else 503, content=report)
 
 
 @router.get("/capabilities")

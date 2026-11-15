@@ -146,8 +146,8 @@ def test_publish_failure_after_redis_ping_succeeds(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     get_settings.cache_clear()
     try:
-        with patch("redis.Redis.from_url", return_value=mock_redis), patch(
-            "app.routers.jobs.process_extraction_job_task.apply_async",
+        with patch("app.dispatch.is_broker_reachable", return_value=True), patch(
+            "app.dispatch.celery_app.send_task",
             side_effect=RuntimeError("Broker connection dropped during publish"),
         ):
             res = client.post("/api/v1/jobs", json={"upload_session_id": sid}, headers=headers)
@@ -160,8 +160,8 @@ def test_publish_failure_after_redis_ping_succeeds(monkeypatch):
 
     # Case B: Development with ALLOW_BACKGROUND_TASK_FALLBACK=true -> falls back cleanly
     sid2 = _upload_chunks(headers, "pub_fail_dev.txt", "Fallback succeeds".encode("utf-8"))
-    with patch("redis.Redis.from_url", return_value=mock_redis), patch(
-        "app.routers.jobs.process_extraction_job_task.apply_async",
+    with patch("app.dispatch.is_broker_reachable", return_value=True), patch(
+        "app.dispatch.celery_app.send_task",
         side_effect=RuntimeError("Broker connection dropped during publish"),
     ):
         res2 = client.post("/api/v1/jobs", json={"upload_session_id": sid2}, headers=headers)
@@ -251,11 +251,17 @@ def test_production_rejects_placeholder_secret():
     with pytest.raises(ValueError, match="CORS_ORIGINS"):
         Settings(APP_ENV="production", SECRET_KEY="A" * 40, CORS_ORIGINS="*").validate_production_safety()
 
-    # Strong 32+ char secret + explicit CORS origin succeeds
+    # Strong 32+ char secret + explicit CORS origin + durable PostgreSQL & S3 succeeds
     Settings(
         APP_ENV="production",
         SECRET_KEY="A" * 40,
         CORS_ORIGINS="https://tamil-doc-studio.vercel.app",
+        ALLOW_BACKGROUND_TASK_FALLBACK=False,
+        DATABASE_URL="postgresql+asyncpg://user:pass@db:5432/app",
+        SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
+        STORAGE_BACKEND="s3",
+        S3_ACCESS_KEY="prod-access-key",
+        S3_SECRET_KEY="prod-secret-key",
     ).validate_production_safety()
 
 

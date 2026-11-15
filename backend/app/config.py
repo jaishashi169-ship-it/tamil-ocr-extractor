@@ -61,7 +61,7 @@ class Settings(BaseSettings):
         return [origin.strip().rstrip("/") for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     def validate_production_safety(self) -> None:
-        """Reject insecure placeholder secrets and wildcard CORS when running in production."""
+        """Reject insecure placeholder secrets, wildcard CORS, and non-durable SQLite/local storage in production."""
         if self.APP_ENV == "production":
             if (
                 not self.SECRET_KEY
@@ -75,6 +75,27 @@ class Settings(BaseSettings):
             if not origins or "*" in origins:
                 raise ValueError(
                     "APP_ENV=production requires explicit CORS_ORIGINS (wildcard '*' is not allowed)."
+                )
+            if self.ALLOW_BACKGROUND_TASK_FALLBACK:
+                raise ValueError(
+                    "APP_ENV=production requires ALLOW_BACKGROUND_TASK_FALLBACK=false."
+                )
+            if self.DATABASE_URL.startswith("sqlite") or self.SYNC_DATABASE_URL.startswith("sqlite"):
+                raise ValueError(
+                    "APP_ENV=production requires managed PostgreSQL; SQLite or /tmp database fallback is not permitted."
+                )
+            if self.STORAGE_BACKEND.lower() != "s3":
+                raise ValueError(
+                    "APP_ENV=production requires durable private object storage (STORAGE_BACKEND=s3); local/tmp storage is not permitted."
+                )
+            if (
+                not self.S3_BUCKET_NAME
+                or not self.S3_ACCESS_KEY
+                or not self.S3_SECRET_KEY
+                or self.S3_ACCESS_KEY == "minioadmin"
+            ):
+                raise ValueError(
+                    "APP_ENV=production requires valid S3 credentials and bucket (default minioadmin placeholder is not permitted)."
                 )
 
 

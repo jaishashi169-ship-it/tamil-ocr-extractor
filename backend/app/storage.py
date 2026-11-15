@@ -1,7 +1,9 @@
 import hashlib
+import os
 import shutil
+import tempfile
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import Any, BinaryIO, Dict, Optional
 import boto3
 from botocore.client import Config
 
@@ -12,17 +14,20 @@ settings = get_settings()
 
 
 class PrivateStorage:
-    """Private object storage supporting local filesystem and S3/MinIO."""
+    """Private object storage supporting S3-compatible durable storage and local dev filesystem."""
 
     def __init__(self) -> None:
         self.backend = settings.STORAGE_BACKEND.lower()
         self.local_root = Path(settings.LOCAL_STORAGE_ROOT).resolve()
-        try:
-            self.local_root.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            import tempfile
-            self.local_root = (Path(tempfile.gettempdir()) / "private_storage").resolve()
-            self.local_root.mkdir(parents=True, exist_ok=True)
+        # /tmp is permitted strictly for disposable processing scratch files, never durable storage
+        self.scratch_root = (Path(tempfile.gettempdir()) / "doc_studio_disposable").resolve()
+        self.local_writable = False
+        if self.backend == "local" and settings.APP_ENV != "production" and not os.environ.get("VERCEL"):
+            try:
+                self.local_root.mkdir(parents=True, exist_ok=True)
+                self.local_writable = os.access(self.local_root, os.W_OK)
+            except OSError:
+                self.local_writable = False
         self._s3 = None
         self._s3_public = None
         if self.backend == "s3":
@@ -57,6 +62,27 @@ class PrivateStorage:
 
     def is_s3(self) -> bool:
         return self.backend == "s3" and self._s3 is not None
+
+    def check_readiness(self) -> Dict[str, Any]:
+        if self.backend == "s3":
+            if not self._s3:
+                return {"ready": False, "backend": "s3", "reason": "S3 client not initialized"}
+            if settings.APP_ENV == "production" and settings.S3_ACCESS_KEY == "minioadmin":
+                return {"ready": False, "backend": "s3", "reason": "Placeholder S3 credentials in production"}
+            try:
+                self._s3.head_bucket(Bucket=settings.S3_BUCKET_NAME)
+                return {"ready": True, "backend": "s3", "bucket": settings.S3_BUCKET_NAME}
+            except Exception as exc:
+                return {"ready": False, "backend": "s3", "reason": f"S3 bucket unreachable: {exc}"}
+        if settings.APP_ENV == "production" or os.environ.get("VERCEL"):
+            return {
+                "ready": False,
+                "backend": self.backend,
+                "reason": "Durable private object storage (STORAGE_BACKEND=s3) is required on Vercel/production; /tmp or local storage is not permitted for durable files.",
+            }
+        if not self.local_writable:
+            return {"ready": False, "backend": "local", "reason": "Local storage root is not writable"}
+        return {"ready": True, "backend": "local"}
 
     def create_multipart_upload(self, key: str) -> str:
         assert self._s3 is not None
@@ -138,7 +164,17 @@ class PrivateStorage:
         )
 
     def local_path_for(self, key: str) -> Path:
+        if settings.APP_ENV == "production" or os.environ.get("VERCEL") or not self.local_writable:
+            raise RuntimeError(
+                "Durable private object storage (STORAGE_BACKEND=s3) is required; local or /tmp storage is not permitted for uploaded originals or durable exports."
+            )
         path = safe_join(self.local_root, *key.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def scratch_path_for(self, key: str) -> Path:
+        """Disposable processing path in /tmp used strictly while a worker processes an S3 object."""
+        path = safe_join(self.scratch_root, *key.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -205,44 +241,56 @@ class PrivateStorage:
         return total_bytes, sha256.hexdigest()
 
     def abort_chunks(self, session_id: str) -> None:
-        chunk_dir = self.local_path_for(f"chunks/{session_id}")
-        shutil.rmtree(chunk_dir, ignore_errors=True)
+        if self.backend == "local" and self.local_writable:
+            chunk_dir = self.local_path_for(f"chunks/{session_id}")
+            shutil.rmtree(chunk_dir, ignore_errors=True)
 
     def save_bytes(self, key: str, data: bytes) -> str:
-        path = self.local_path_for(key)
-        path.write_bytes(data)
         if self.backend == "s3" and self._s3 is not None:
             self._s3.put_object(Bucket=settings.S3_BUCKET_NAME, Key=key, Body=data)
+            return key
+        path = self.local_path_for(key)
+        path.write_bytes(data)
         return key
 
     def save_file(self, key: str, src_path: Path) -> str:
+        if self.backend == "s3" and self._s3 is not None:
+            self._s3.upload_file(str(src_path), settings.S3_BUCKET_NAME, key)
+            return key
         dest = self.local_path_for(key)
         if src_path.resolve() != dest.resolve():
             shutil.copy2(src_path, dest)
-        if self.backend == "s3" and self._s3 is not None:
-            self._s3.upload_file(str(dest), settings.S3_BUCKET_NAME, key)
         return key
 
     def get_local_file(self, key: str) -> Path:
+        if self.backend == "s3" and self._s3 is not None:
+            scratch_path = self.scratch_path_for(key)
+            if not scratch_path.exists():
+                self._s3.download_file(settings.S3_BUCKET_NAME, key, str(scratch_path))
+            if not scratch_path.exists():
+                raise FileNotFoundError(f"Storage object not found: {key}")
+            return scratch_path
         path = self.local_path_for(key)
-        if not path.exists() and self.backend == "s3" and self._s3 is not None:
-            self._s3.download_file(settings.S3_BUCKET_NAME, key, str(path))
         if not path.exists():
             raise FileNotFoundError(f"Storage object not found: {key}")
         return path
 
     def read_bytes(self, key: str) -> bytes:
+        if self.backend == "s3" and self._s3 is not None:
+            res = self._s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+            return res["Body"].read()
         return self.get_local_file(key).read_bytes()
 
     def delete_key(self, key: Optional[str]) -> None:
         if not key:
             return
-        try:
-            path = self.local_path_for(key)
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
+        for root in (self.local_root, self.scratch_root):
+            try:
+                path = safe_join(root, *key.split("/"))
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
         if self.backend == "s3" and self._s3 is not None:
             try:
                 self._s3.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
@@ -250,12 +298,13 @@ class PrivateStorage:
                 pass
 
     def delete_prefix(self, prefix: str) -> None:
-        try:
-            target_dir = self.local_path_for(prefix)
-            if target_dir.exists() and target_dir.is_dir():
-                shutil.rmtree(target_dir, ignore_errors=True)
-        except Exception:
-            pass
+        for root in (self.local_root, self.scratch_root):
+            try:
+                target_dir = safe_join(root, *prefix.split("/"))
+                if target_dir.exists() and target_dir.is_dir():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+            except Exception:
+                pass
         if self.backend == "s3" and self._s3 is not None:
             try:
                 paginator = self._s3.get_paginator("list_objects_v2")
@@ -267,6 +316,8 @@ class PrivateStorage:
                 pass
 
     def get_total_usage_bytes(self) -> int:
+        if not self.local_root.exists():
+            return 0
         total = 0
         for p in self.local_root.rglob("*"):
             if p.is_file():

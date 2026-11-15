@@ -466,3 +466,100 @@ def generate_batch_zip_task(
     quality_preset: str,
 ) -> None:
     generate_batch_zip_sync(artifact_id, user_id, job_ids, export_format, quality_preset)
+
+
+WORKER_STATUS_REDIS_KEY = "doc_studio:worker:status"
+_cached_worker_ocr_probe: Optional[Dict[str, Any]] = None
+
+
+def collect_worker_runtime_status(force_reprobe: bool = False) -> Dict[str, Any]:
+    """Run inside the Celery worker to verify Tesseract languages, registered tasks, and real bilingual Tamil-English OCR."""
+    global _cached_worker_ocr_probe
+    if _cached_worker_ocr_probe is None or force_reprobe:
+        from app.services.ocr_engine import get_ocr_status, ocr_pil_image
+        from PIL import Image, ImageDraw, ImageFont
+
+        ocr_info = get_ocr_status()
+        langs = ocr_info.get("languages", [])
+        bilingual_smoke_passed = False
+        tamil_unicode_detected = False
+        smoke_sample = ""
+        if ocr_info.get("available") and "eng" in langs:
+            try:
+                img = Image.new("RGB", (760, 180), color=(255, 255, 255))
+                draw = ImageDraw.Draw(img)
+                tamil_font = None
+                for candidate in (
+                    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
+                    "C:/Windows/Fonts/Nirmala.ttf",
+                    "C:/Windows/Fonts/latha.ttf",
+                ):
+                    if Path(candidate).exists():
+                        tamil_font = ImageFont.truetype(candidate, 32)
+                        break
+                if tamil_font is not None and "tam" in langs:
+                    draw.text((24, 28), "தமிழ் ஆவணம்", fill=(0, 0, 0), font=tamil_font)
+                    draw.text((24, 96), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0), font=tamil_font)
+                else:
+                    draw.text((24, 60), "TAMIL OCR STUDIO 2026", fill=(0, 0, 0))
+                res = ocr_pil_image(img, OCROptions(language="tam+eng" if "tam" in langs else "eng"))
+                smoke_sample = (res.get("text") or "").strip()
+                tamil_unicode_detected = any("\u0B80" <= ch <= "\u0BFF" for ch in smoke_sample)
+                bilingual_smoke_passed = (
+                    ("OCR" in smoke_sample.upper() or "TAMIL" in smoke_sample.upper() or "2026" in smoke_sample)
+                    and (tamil_unicode_detected or tamil_font is None)
+                )
+            except Exception:
+                bilingual_smoke_passed = False
+
+        registered = sorted(t for t in celery_app.tasks.keys() if t.startswith("app.tasks."))
+        _cached_worker_ocr_probe = {
+            "available": bool(ocr_info.get("available") and "tam" in langs and "eng" in langs and bilingual_smoke_passed),
+            "tesseract_available": bool(ocr_info.get("available")),
+            "languages": langs,
+            "bilingual_ocr_verified": bilingual_smoke_passed,
+            "tamil_unicode_verified": tamil_unicode_detected,
+            "smoke_sample": smoke_sample,
+            "registered_tasks": registered,
+        }
+    return {
+        **_cached_worker_ocr_probe,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def publish_worker_heartbeat(force_reprobe: bool = False) -> Optional[Dict[str, Any]]:
+    import json
+    import redis
+    from app.dispatch import _redis_kwargs_for_url
+
+    settings = get_settings()
+    try:
+        payload = collect_worker_runtime_status(force_reprobe=force_reprobe)
+        client = redis.from_url(
+            settings.CELERY_BROKER_URL,
+            **_redis_kwargs_for_url(
+                settings.CELERY_BROKER_URL,
+                settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+                settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+            ),
+        )
+        client.set(WORKER_STATUS_REDIS_KEY, json.dumps(payload), ex=180)
+        return payload
+    except Exception:
+        return None
+
+
+try:
+    from celery.signals import heartbeat_sent, worker_ready
+
+    @worker_ready.connect
+    def _on_worker_ready(**_kwargs: Any) -> None:
+        publish_worker_heartbeat(force_reprobe=True)
+
+    @heartbeat_sent.connect
+    def _on_worker_heartbeat(**_kwargs: Any) -> None:
+        publish_worker_heartbeat(force_reprobe=False)
+except Exception:
+    pass

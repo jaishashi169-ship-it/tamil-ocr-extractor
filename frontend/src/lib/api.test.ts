@@ -32,6 +32,8 @@ describe("Frontend API & chunked upload behavior", () => {
   });
 
   it("normalizes NEXT_PUBLIC_API_URL without duplicating /api/v1 and rejects missing or placeholder URLs in production", () => {
+    expect(resolveApiBase("/api/v1", "preview-123.vercel.app")).toBe("/api/v1");
+    expect(resolveApiBase("/api/", "preview-123.vercel.app")).toBe("/api/v1");
     expect(resolveApiBase("https://api.tamilstudio.app", "app.vercel.app")).toBe("https://api.tamilstudio.app/api/v1");
     expect(resolveApiBase("https://api.tamilstudio.app/api/v1/", "app.vercel.app")).toBe(
       "https://api.tamilstudio.app/api/v1"

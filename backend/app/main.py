@@ -1,9 +1,12 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.database import Base, engine
 from app.routers import admin, auth, exports, jobs, pages, study, uploads
+from app.routers.admin import evaluate_readiness
 
 settings = get_settings()
 
@@ -25,14 +28,26 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     get_settings().validate_production_safety()
-    # Ensure tables exist in local/SQLite dev mode (PostgreSQL uses Alembic in production)
-    if str(engine.url.drivername).startswith("sqlite"):
+    # Ensure tables exist in local/SQLite dev mode (PostgreSQL uses Alembic in production; never write SQLite on serverless)
+    if (
+        str(engine.url.drivername).startswith("sqlite")
+        and settings.APP_ENV != "production"
+        and not os.environ.get("VERCEL")
+    ):
         Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "app": settings.APP_NAME}
+    """Liveness check confirming the FastAPI process is responsive."""
+    return {"status": "ok", "liveness": "ok", "app": settings.APP_NAME}
+
+
+@app.get("/health/ready")
+def readiness_check():
+    """Readiness check verifying durable database, Redis broker, private storage, and OCR worker dependencies."""
+    report = evaluate_readiness()
+    return JSONResponse(status_code=200 if report["ready"] else 503, content=report)
 
 
 API_PREFIX = "/api/v1"

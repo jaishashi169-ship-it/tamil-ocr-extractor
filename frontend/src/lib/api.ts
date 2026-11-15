@@ -27,6 +27,9 @@ export function resolveApiBase(
   const isLocalHost = !hostname || hostname === "localhost" || hostname === "127.0.0.1";
   const trimmed = (envUrl || "").trim().replace(/\/+$/, "");
   if (trimmed) {
+    if (trimmed === "/api/v1" || trimmed === "/api") {
+      return "/api/v1";
+    }
     if (!isLocalHost) {
       let parsed: URL;
       try {
@@ -48,7 +51,7 @@ export function resolveApiBase(
     return "http://localhost:8000/api/v1";
   }
   throw new Error(
-    "NEXT_PUBLIC_API_URL is not configured. Set NEXT_PUBLIC_API_URL to your HTTPS backend API base (including /api/v1) before building the frontend."
+    "NEXT_PUBLIC_API_URL is not configured. Set NEXT_PUBLIC_API_URL to /api/v1 (same-origin service routing) or your HTTPS backend API base before building the frontend."
   );
 }
 

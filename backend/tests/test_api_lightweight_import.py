@@ -42,23 +42,69 @@ async def _verify():
         h = await client.get("/health")
         assert h.status_code == 200, h.text
         assert h.json()["status"] == "ok"
+        assert h.json()["liveness"] == "ok"
+
+        r = await client.get("/health/ready")
+        assert r.status_code == 503, r.text
+        r_data = r.json()
+        assert r_data["status"] == "not_ready"
+        assert r_data["dependencies"]["worker"]["ready"] is False
+        assert r_data["dependencies"]["worker"]["status"] == "configured_but_unverified"
 
         cap = await client.get("/api/v1/capabilities")
         assert cap.status_code == 200, cap.text
         data = cap.json()
+        assert data["ocr_status"]["available"] is False
+        assert data["ocr_status"]["status"] == "configured_but_unverified"
         assert data["ocr_status"]["execution_mode"] == "worker_daemon"
         assert data["ocr_status"]["verified_locally"] is False
+        assert data["ocr_status"]["verified_worker"] is False
         assert data["installed_ocr_languages"] == []
         assert "tam" in data["configured_ocr_languages"]
 
 asyncio.run(_verify())
 """
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(backend_dir),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    out_file = tmp_path / "proc_out.log"
+    with open(out_file, "w", encoding="utf-8") as log_f:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(backend_dir),
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+    output_text = out_file.read_text(encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, f"Subprocess failed ({proc.returncode}):\n{output_text}"
+
+
+def test_production_safety_rejects_sqlite_and_local_storage():
+    import pytest
+    from app.config import Settings
+
+    # Rejects SQLite in production
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 40,
+            CORS_ORIGINS="https://tamilstudio.app",
+            ALLOW_BACKGROUND_TASK_FALLBACK=False,
+            DATABASE_URL="sqlite:///./prod.db",
+            SYNC_DATABASE_URL="sqlite:///./prod.db",
+            STORAGE_BACKEND="s3",
+            S3_ACCESS_KEY="prod-key",
+            S3_SECRET_KEY="prod-secret",
+        ).validate_production_safety()
+
+    # Rejects local storage in production
+    with pytest.raises(ValueError, match="STORAGE_BACKEND=s3"):
+        Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 40,
+            CORS_ORIGINS="https://tamilstudio.app",
+            ALLOW_BACKGROUND_TASK_FALLBACK=False,
+            DATABASE_URL="postgresql+asyncpg://user:pass@db:5432/app",
+            SYNC_DATABASE_URL="postgresql://user:pass@db:5432/app",
+            STORAGE_BACKEND="local",
+        ).validate_production_safety()
