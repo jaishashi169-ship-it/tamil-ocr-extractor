@@ -24,6 +24,41 @@ RETENTION_PG_ADVISORY_LOCK_ID = 748291045
 _local_cleanup_lock = threading.Lock()
 
 
+class _RedisLockRenewer(threading.Thread):
+    """
+    Background watchdog that extends the Redis retention lock TTL periodically
+    while a long cleanup (storage deletions, DB cleanup) is actively running.
+    Prevents lock expiry during heavy storage operations.
+    """
+
+    def __init__(self, redis_client: Any, lock_key: str, lock_token: str, ttl_seconds: int):
+        super().__init__(daemon=True, name="redis-retention-lock-renewer")
+        self.redis_client = redis_client
+        self.lock_key = lock_key
+        self.lock_token = lock_token
+        self.ttl_seconds = ttl_seconds
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        renew_interval = max(0.5, self.ttl_seconds / 3.0)
+        while not self.stop_event.wait(renew_interval):
+            try:
+                res = self.redis_client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    self.lock_key,
+                    self.lock_token,
+                    self.ttl_seconds,
+                )
+                if not res:
+                    break
+            except Exception:
+                break
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+
 class StorageQuotaExceededError(Exception):
     """Raised when a user's storage quota or the total account storage budget would be exceeded."""
 
@@ -34,12 +69,15 @@ def _try_retention_distributed_lock(db: Session, ttl_seconds: int = 120) -> Iter
     Acquire a non-blocking distributed lock across process threads, Redis (if reachable),
     and PostgreSQL (`pg_try_advisory_xact_lock`) so overlapping retention triggers
     (in-worker scheduler, Celery task, opportunistic check, and Vercel Cron) never collide.
+    Holds the PostgreSQL transaction-scoped advisory lock for the full duration of cleanup
+    across all external storage operations until completion.
     """
     if not _local_cleanup_lock.acquire(blocking=False):
         yield False
         return
 
     redis_client = None
+    renewer: Optional[_RedisLockRenewer] = None
     lock_token = uuid.uuid4().hex
     try:
         cfg = get_settings()
@@ -59,6 +97,9 @@ def _try_retention_distributed_lock(db: Session, ttl_seconds: int = 120) -> Iter
                     redis_client = None
                     yield False
                     return
+                # Start active lease renewal watchdog to keep Redis lock alive during long sweeps
+                renewer = _RedisLockRenewer(redis_client, RETENTION_LOCK_REDIS_KEY, lock_token, ttl_seconds)
+                renewer.start()
             except Exception:
                 redis_client = None
 
@@ -76,6 +117,11 @@ def _try_retention_distributed_lock(db: Session, ttl_seconds: int = 120) -> Iter
 
         yield True
     finally:
+        if renewer is not None:
+            try:
+                renewer.stop()
+            except Exception:
+                pass
         if redis_client is not None:
             try:
                 redis_client.eval(
@@ -84,6 +130,15 @@ def _try_retention_distributed_lock(db: Session, ttl_seconds: int = 120) -> Iter
                     RETENTION_LOCK_REDIS_KEY,
                     lock_token,
                 )
+            except Exception:
+                pass
+        dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
+        if dialect == "postgresql":
+            # If the session is still active and uncommitted (e.g. no rows modified),
+            # rollback ensures the transaction-scoped advisory lock is cleanly released.
+            try:
+                if db.is_active:
+                    db.rollback()
             except Exception:
                 pass
         _local_cleanup_lock.release()

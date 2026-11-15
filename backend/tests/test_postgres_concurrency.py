@@ -227,3 +227,137 @@ def test_retention_cleanup_lock_prevents_overlap(pg_sessionmaker):
     finally:
         db1.close()
         db2.close()
+
+
+def test_cleanup_outlasting_redis_ttl_prevents_overlap_via_pg_lock(pg_sessionmaker, monkeypatch):
+    """
+    Test that even if a cleanup run outlasts a Redis lock TTL (or if Redis key expires mid-cleanup),
+    the PostgreSQL transaction-scoped advisory lock remains held across all helper operations
+    and external storage calls, strictly preventing a second concurrent cleanup run from
+    performing any overlapping destructive work.
+    """
+    import time
+    from datetime import datetime, timedelta, timezone
+    from app.models import ExportArtifact, Job, User
+    from app.services.retention import cleanup_expired_resources, _try_retention_distributed_lock
+    import app.storage as storage_mod
+
+    _reset(pg_sessionmaker)
+
+    # Seed an expired export artifact with a storage key
+    now_utc = datetime.now(timezone.utc)
+    expired_time = now_utc - timedelta(days=2)
+    with pg_sessionmaker() as db:
+        user = User(
+            email=f"pgconc-ret-{uuid.uuid4().hex[:6]}@studio.local",
+            hashed_password="x",
+            role="user",
+            storage_quota_bytes=750 * MB,
+            retention_days=7,
+        )
+        db.add(user)
+        db.flush()
+        job = Job(
+            user_id=user.id,
+            original_filename="doc.pdf",
+            format_type="application/pdf",
+            file_size_bytes=5000,
+            original_storage_key="uploads/test.pdf",
+            status="completed",
+        )
+        db.add(job)
+        db.flush()
+        art = ExportArtifact(
+            user_id=user.id,
+            job_id=job.id,
+            export_format="pdf",
+            status="completed",
+            storage_key="exports/test-expired.pdf",
+            file_size_bytes=1000,
+            expires_at=expired_time,
+        )
+        db.add(art)
+        db.commit()
+        art_id = art.id
+
+    thread1_in_storage = threading.Event()
+    thread1_allow_finish = threading.Event()
+    thread2_finished = threading.Event()
+
+    original_delete_key = storage_mod.storage.delete_key
+    storage_deletions: list[str] = []
+
+    def mocked_delete_key(key: str) -> None:
+        storage_deletions.append(key)
+        # Signal that Thread 1 is inside external storage deletion while holding the PG xact lock
+        thread1_in_storage.set()
+        # Wait until Thread 2 has attempted its overlapping run
+        thread1_allow_finish.wait(timeout=10)
+        original_delete_key(key)
+
+    monkeypatch.setattr(storage_mod.storage, "delete_key", mocked_delete_key)
+
+    thread1_result: list[dict] = []
+    thread2_result: list[dict] = []
+    commits_during_storage: list[str] = []
+
+    def _run_thread1():
+        db1 = pg_sessionmaker()
+        try:
+            # Run cleanup with a simulated 1-second TTL to test operations lasting longer than lock TTL
+            res = cleanup_expired_resources(db1, stale_upload_hours=1)
+            thread1_result.append(res)
+        finally:
+            db1.close()
+
+    def _run_thread2():
+        # Wait for Thread 1 to enter external storage deletion
+        assert thread1_in_storage.wait(timeout=10)
+        # Sleep to simulate Redis lock expiry (e.g. outlasting Redis TTL)
+        time.sleep(0.2)
+        db2 = pg_sessionmaker()
+        try:
+            # Thread 2 attempts to run cleanup concurrently
+            res = cleanup_expired_resources(db2, stale_upload_hours=1)
+            thread2_result.append(res)
+        finally:
+            db2.close()
+            thread2_finished.set()
+            thread1_allow_finish.set()
+
+    t1 = threading.Thread(target=_run_thread1)
+    t2 = threading.Thread(target=_run_thread2)
+
+    t1.start()
+    t2.start()
+
+    t2.join(timeout=15)
+    t1.join(timeout=15)
+
+    # Thread 2 MUST have been skipped because PostgreSQL transaction advisory lock was held by Thread 1
+    assert len(thread2_result) == 1, thread2_result
+    assert thread2_result[0]["skipped_locked"] is True
+    assert thread2_result[0]["deleted_exports"] == 0
+    assert thread2_result[0]["deleted_jobs"] == 0
+
+    # Thread 1 MUST have successfully cleaned up the artifact and committed
+    assert len(thread1_result) == 1, thread1_result
+    assert thread1_result[0]["skipped_locked"] is False
+    assert thread1_result[0]["deleted_exports"] == 1
+
+    # External storage was called exactly once (by Thread 1, never by Thread 2)
+    assert storage_deletions == ["exports/test-expired.pdf"]
+
+    # Verify the database state
+    with pg_sessionmaker() as db:
+        remaining = db.query(ExportArtifact).filter(ExportArtifact.id == art_id).first()
+        assert remaining is None
+
+    # Now verify a subsequent run (Thread 3) can acquire the lock cleanly since Thread 1 committed
+    with pg_sessionmaker() as db3:
+        t3_res = cleanup_expired_resources(db3, stale_upload_hours=1)
+        assert t3_res["skipped_locked"] is False
+        assert t3_res["deleted_exports"] == 0
+
+    _reset(pg_sessionmaker)
+
