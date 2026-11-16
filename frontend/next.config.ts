@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 const PLACEHOLDER_API_PATTERNS = [
   "example.com",
@@ -38,6 +39,16 @@ if (process.env.VERCEL === "1") {
 }
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: path.join(__dirname),
+  outputFileTracingExcludes: {
+    "*": [
+      "../backend/**",
+      "../private_storage/**",
+      "../**/*.db",
+      "../**/*.sqlite*",
+      "../**/*.pyc",
+    ],
+  },
   ...(process.env.VERCEL === "1" ? {} : { output: "standalone" }),
 };
 

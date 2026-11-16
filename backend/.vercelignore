@@ -1,0 +1,15 @@
+# Exclude local virtualenvs, databases, storage, and tests from backend Vercel service
+.venv/
+venv/
+private_storage/
+*.db
+*.db-journal
+*.sqlite*
+tests/
+__pycache__/
+.pytest_cache/
+*.zip
+*.tar.gz
+Dockerfile*
+docker-compose*.yml
+*.log

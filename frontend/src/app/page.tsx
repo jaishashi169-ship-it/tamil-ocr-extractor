@@ -156,7 +156,7 @@ export default function HomePage() {
         setQueue((prev) => prev.map((q) => (q.localId === item.localId ? { ...q, status: "cancelled" } : q)));
       } else {
         setQueue((prev) =>
-          prev.map((q) => (q.localId === item.localId ? { ...q, status: "error", error: msg } : q))
+          prev.map((q) => (q.localId === item.localId ? { ...q, status: "error", error: msg, sessionId: undefined } : q))
         );
       }
     }

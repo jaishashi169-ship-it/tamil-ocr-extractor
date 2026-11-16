@@ -521,10 +521,40 @@ def complete_upload(
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
 
-    if session.status in {"processing", "completed", "aborted", "failed"} or session.sha256_hash:
+    if session.status in {"processing", "completed"}:
+        is_blob = session.s3_upload_id == "vercel-blob-sdk-managed"
+        recv = (
+            session.expected_size_bytes
+            if session.status == "completed"
+            else (
+                session.expected_size_bytes
+                if is_blob
+                else (
+                    min(session.expected_size_bytes, len(session.received_chunks or []) * session.chunk_size_bytes)
+                    if session.s3_upload_id
+                    else storage.get_session_chunks_total_bytes(session.id)
+                )
+            )
+        )
+        return UploadSessionResponse(
+            session_id=session.id,
+            filename=session.filename,
+            expected_size_bytes=session.expected_size_bytes,
+            received_bytes=recv,
+            chunk_size_bytes=session.chunk_size_bytes,
+            total_chunks=session.total_chunks,
+            received_chunks=session.received_chunks or [],
+            status=session.status,
+            format_type=session.format_type,
+            sha256_hash=session.sha256_hash,
+            upload_mode=storage.direct_upload_mode() if session.s3_upload_id else "proxy",
+            storage_key=session.storage_key,
+        )
+
+    if session.status in {"aborted", "failed"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Upload session has already been accepted or finalized; re-finalization or replacement is rejected.",
+            detail=f"Upload session is {session.status} and cannot be finalized.",
         )
 
     is_blob_sdk_upload = session.s3_upload_id == "vercel-blob-sdk-managed"

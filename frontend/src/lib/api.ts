@@ -187,24 +187,47 @@ export async function uploadFileInChunks(
   let uploadAuthorizationToken = "";
 
   if (sessionId) {
-    const statusRes = await apiFetch<{
-      session_id: string;
-      chunk_size_bytes: number;
-      total_chunks: number;
-      received_chunks: number[];
-      upload_mode?: "proxy" | "direct_s3" | "vercel_blob";
-      storage_key?: string;
-      handle_upload_url?: string;
-      upload_authorization_token?: string;
-    }>(`/uploads/${sessionId}`);
-    effectiveChunkSize = statusRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
-    totalChunks = statusRes.total_chunks;
-    receivedSet = new Set(statusRes.received_chunks);
-    uploadMode = statusRes.upload_mode || "proxy";
-    storageKey = statusRes.storage_key || "";
-    handleUploadUrl = statusRes.handle_upload_url || "/api/blob/upload";
-    uploadAuthorizationToken = statusRes.upload_authorization_token || "";
-  } else {
+    try {
+      const statusRes = await apiFetch<{
+        session_id: string;
+        status?: string;
+        chunk_size_bytes: number;
+        total_chunks: number;
+        received_chunks: number[];
+        upload_mode?: "proxy" | "direct_s3" | "vercel_blob";
+        storage_key?: string;
+        handle_upload_url?: string;
+        upload_authorization_token?: string;
+        format_type?: string;
+        sha256_hash?: string;
+      }>(`/uploads/${sessionId}`);
+
+      if (statusRes.status === "completed") {
+        callbacks.onProgress(file.size, file.size, 100);
+        return {
+          sessionId: statusRes.session_id,
+          formatType: statusRes.format_type || "bin",
+          sha256: statusRes.sha256_hash || "",
+        };
+      }
+
+      if (statusRes.status === "aborted" || statusRes.status === "failed") {
+        sessionId = undefined;
+      } else {
+        effectiveChunkSize = statusRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
+        totalChunks = statusRes.total_chunks;
+        receivedSet = new Set(statusRes.received_chunks);
+        uploadMode = statusRes.upload_mode || "proxy";
+        storageKey = statusRes.storage_key || "";
+        handleUploadUrl = statusRes.handle_upload_url || "/api/blob/upload";
+        uploadAuthorizationToken = statusRes.upload_authorization_token || "";
+      }
+    } catch {
+      sessionId = undefined;
+    }
+  }
+
+  if (!sessionId) {
     const initRes = await apiFetch<{
       session_id: string;
       chunk_size_bytes: number;
@@ -311,12 +334,33 @@ export async function uploadFileInChunks(
     }
   }
 
-  let completed = await apiFetch<{
+  let completed: {
     session_id: string;
     status: string;
-    format_type: string;
-    sha256_hash: string;
-  }>(`/uploads/${sessionId}/complete`, { method: "POST" });
+    format_type?: string;
+    sha256_hash?: string;
+  };
+  try {
+    completed = await apiFetch<{
+      session_id: string;
+      status: string;
+      format_type?: string;
+      sha256_hash?: string;
+    }>(`/uploads/${sessionId}/complete`, { method: "POST" });
+  } catch (err: unknown) {
+    const statusCheck = await apiFetch<{
+      session_id: string;
+      status: string;
+      format_type?: string;
+      sha256_hash?: string;
+    }>(`/uploads/${sessionId}`).catch(() => null);
+
+    if (statusCheck && (statusCheck.status === "processing" || statusCheck.status === "completed")) {
+      completed = statusCheck;
+    } else {
+      throw err;
+    }
+  }
 
   const deadline = Date.now() + 300_000;
   while (completed.status === "processing") {
