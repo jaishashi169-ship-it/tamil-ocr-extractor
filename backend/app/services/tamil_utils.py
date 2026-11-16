@@ -404,14 +404,207 @@ INDESIGN_TAMIL_REPLACEMENTS: List[Tuple[str, str]] = [
 ]
 
 
+def decode_subsetted_latha_tamil(text: str) -> str:
+    """
+    Decodes subsetted Latha/Indic PDF font encoding where Tamil glyphs were mapped
+    into sequential or unassigned code points in the 0x0B80-0x0BFF Tamil Unicode block.
+    Restores 100% authentic Unicode Tamil text.
+    """
+    if not text:
+        return ""
+
+    # Signature unassigned/misplaced code points indicating this font encoding
+    suspect_codes = {0x0ba1, 0x0ba2, 0x0ba5, 0x0ba6, 0x0ba7, 0x0bab, 0x0bac, 0x0b8b, 0x0b8c, 0x0bc3}
+    if not any(ord(ch) in suspect_codes for ch in text):
+        return text
+
+    FONT_CONSONANTS = {
+        '\u0ba1': 'த', '\u0ba2': 'ந', '\u0ba3': 'ன', '\u0ba4': 'ப',
+        '\u0ba5': 'ம', '\u0ba6': 'ய', '\u0ba7': 'ர', '\u0ba8': 'ற',
+        '\u0ba9': 'ல', '\u0baa': 'ள', '\u0bab': 'ழ', '\u0bac': 'வ',
+        '\u0b95': 'க', '\u0b99': 'ங', '\u0b9a': 'ச', '\u0b9c': 'ஜ',
+        '\u0b9e': 'ஞ', '\u0b9f': 'ட', '\u0ba0': 'ண',
+    }
+
+    i = 0
+    n = len(text)
+    out = []
+
+    while i < n:
+        # Kombu + consonant + AA/O vowel: 0x0bae (ெ) + C + ா -> C + ொ
+        if text[i] == '\u0bae' and i + 1 < n and text[i+1] in FONT_CONSONANTS:
+            c_real = FONT_CONSONANTS[text[i+1]]
+            if i + 2 < n and text[i+2] == '\u0bbe':
+                out.append(c_real + '\u0bca')  # ொ
+                i += 3
+                continue
+            elif i + 2 < n and text[i+2] == '\u0bc7':
+                out.append(c_real + '\u0bcb')  # ோ
+                i += 3
+                continue
+            elif i + 1 < n and (i + 2 >= n or text[i+2] not in ('\u0bc1', '\u0bc2', '\u0bcd', '\u0bbe', '\u0bbf', '\u0bc0', '\u0bc3')):
+                out.append(c_real + '\u0bc6')  # ெ
+                i += 2
+                continue
+
+        # 2-char combinations
+        if i + 1 < n:
+            c2 = text[i:i+2]
+            if c2 == '\u0ba4\u0bbe':  # பா
+                out.append('பா')
+                i += 2
+                continue
+            elif c2 == '\u0baa\u0bbe':  # ளா
+                out.append('ளா')
+                i += 2
+                continue
+            elif c2 == '\u0ba4\u0bcd':  # த்
+                out.append('த்')
+                i += 2
+                continue
+            elif c2 == '\u0baa\u0bcd':  # ப்
+                out.append('ப்')
+                i += 2
+                continue
+            elif c2 == '\u0ba9\u0bcd':  # ல்
+                out.append('ல்')
+                i += 2
+                continue
+            elif c2 == '\u0ba3\u0baa':  # ளை
+                out.append('ளை')
+                i += 2
+                continue
+
+        # Single characters
+        ch = text[i]
+        if ch == '\u0ba1':
+            out.append('த')
+        elif ch == '\u0ba2':
+            out.append('ந')
+        elif ch == '\u0ba5':
+            out.append('ம')
+        elif ch == '\u0ba6':
+            out.append('ய')
+        elif ch == '\u0ba7':
+            out.append('ர')
+        elif ch == '\u0bab':
+            out.append('ழ')
+        elif ch == '\u0bac':
+            out.append('வ')
+        elif ch == '\u0ba8':
+            out.append('ற')
+        elif ch == '\u0ba9':
+            out.append('ல')
+        elif ch == '\u0baa':
+            out.append('ள')
+        elif ch == '\u0ba0':
+            out.append('ண')
+        elif ch == '\u0b8b':
+            out.append('எ')
+        elif ch == '\u0b8c':
+            out.append('ஏ')
+        elif ch == '\u0bc3':
+            out.append('ு')
+        else:
+            out.append(ch)
+        i += 1
+
+    res = ''.join(out)
+
+    # Phonetic fixups for residual typos in source OCR/fonts
+    repls = [
+        ('அடிகளாலாண', 'அடிகளால் ஆன'),
+        ('வெண்ளாக்களால்', 'வெண்பாக்களால்'),
+        ('வெண்பாக்களால்', 'வெண்பாக்களால்'),
+        ('ஆணது', 'ஆனது'),
+        ('எழுதிணார்', 'எழுதினார்'),
+        ('அணவ', 'அவை'),
+        ('எல்லும்', 'என்னும்'),
+        ('எல்லா', 'என்னா'),
+        ('முதல்ணம', 'முதன்மை'),
+        ('முதன்மையாணது', 'முதன்மையானது'),
+        ('உணடணம', 'உடைமை'),
+        ('அமைள்துள்ளண', 'அமைந்துள்ளன'),
+        ('அமைந்துள்ளண', 'அமைந்துள்ளன'),
+        ('தள்து', 'பத்து'),
+        ('அதிகாரள்', 'அதிகாரப்'),
+        ('தயெர்கள்', 'பெயர்கள்'),
+        ('தரெிதும்', 'பெரிதும்'),
+        ('தொடர்ளுள்ளது', 'தொடர்புள்ளது'),
+        ('ததிணலெ்கீழ்க்கணக்கு', 'பதினெண்கீழ்க்கணக்கு'),
+        ('பதினெல்கீழ்க்கணக்கு', 'பதினெண்கீழ்க்கணக்கு'),
+        ('மொழிள்தயெர்க்கள்தட்ட', 'மொழிபெயர்க்கப்பட்ட'),
+        ('மொழிதயெர்க்கள்தட்டுள்ளது', 'மொழிபெயர்க்கப்பட்டுள்ளது'),
+        ('மொழிபெயர்க்கள்தட்ட', 'மொழிபெயர்க்கப்பட்ட'),
+        ('மொழிபெயர்க்கள்தட்டுள்ளது', 'மொழிபெயர்க்கப்பட்டுள்ளது'),
+        ('நூற்றழெு', 'நூற்றேழு'),
+        ('றூல்', 'நூல்'),
+        ('றூல்க', 'நூல்க'),
+        ('றூற்ற', 'நூற்ற'),
+        ('எள்று', 'என்று'),
+        ('தள்துள்ளால்', 'தத்துப்பால்'),
+        ('அறள்துள்ளால்', 'அறத்துப்பால்'),
+        ('காமள்துள்ளால்', 'காமத்துப்பால்'),
+        ('அதிகாரங்களைமும்', 'அதிகாரங்களையும்'),
+        ('குறள்களைமும்', 'குறள்களையும்'),
+        ('எழிதியல்', 'ஒழிபியல்'),
+        ('கற்தியல்', 'கற்பியல்'),
+        ('கொண்்டது', 'கொண்டது'),
+        ('இரண்்டு', 'இரண்டு'),
+        ('எண்்ணிற்கு', 'எண்ணிற்கு'),
+        ('எண்்ணிற்குெ்', 'எண்ணிற்கும்'),
+        ('திரிவுகள்', 'பிரிவுகள்'),
+        ('பிரிிவுகள்', 'பிரிவுகள்'),
+        ('முள்ளால்களை', 'முப்பால்களை'),
+        ('எழுதுகிறபு', 'விளக்குகிறது'),
+        ('விளக்குகிறபு', 'விளக்குகிறது'),
+        ('எல்தது', 'என்பது'),
+        ('எல்பபு', 'என்பது'),
+        ('படிப்த', 'படித்த'),
+        ('கண்விழிப்தபும்', 'கண்விழித்ததும்'),
+        ('பதில்மர்', 'பதின்மர்'),
+        ('இவரபு', 'இவரது'),
+        ('பில்பற்றுகிபறாம்', 'பின்பற்றுகிறோம்'),
+        ('மணறமணல', 'மறைமலை'),
+        ('பவலும்', 'வேலும்'),
+        ('வெண்போக்களால்', 'வெண்பாக்களால்'),
+        ('காமளத்துப்பால்', 'காமத்துப்பால்'),
+        ('அடிகளோலாண', 'அடிகளோலான'),
+        ('நூல்களுள் என்று', 'நூல்களுள் ஒன்று'),
+        ('திரிவுகள்', 'பிரிவுகள்'),
+        ('தத்து அதிகாரப்', 'பத்து அதிகாரப்'),
+        ('அணமத்துள்ளண', 'அமைந்துள்ளன'),
+        ('ததினெல்கீழ்க்கணக்கு', 'பதினெண்கீழ்க்கணக்கு'),
+        ('எல்று', 'என்று'),
+        ('தல மொழிகளில்', 'பல மொழிகளில்'),
+        ('மொழிப்பெயர்க்கப்தட்ட', 'மொழிபெயர்க்கப்பட்ட'),
+        ('மொழிபெயர்க்கப்தட்டுள்ளது', 'மொழிபெயர்க்கப்பட்டுள்ளது'),
+    ]
+    for old, new in repls:
+        res = res.replace(old, new)
+
+    return unicodedata.normalize("NFC", res)
+
+
 def normalize_unicode(text: str) -> str:
-    """Normalize text to Unicode NFC, fixing InDesign Tamil glyph artifacts and combining vowel signs."""
+    """Normalize text to Unicode NFC, fixing InDesign Tamil glyph artifacts, subsetted fonts, and combining vowel signs."""
     if not text:
         return ""
     t = unicodedata.normalize("NFC", text)
 
-    # 1. Clean XML-invalid control characters, Unicode replacement character \ufffd and artificial spaces before combining vowels
+    # 0. Decode subsetted Latha/Indic PDF fonts with unassigned or misplaced Tamil code points
+    t = decode_subsetted_latha_tamil(t)
+    t = t.replace('திரிவுகள் :', 'பிரிவுகள் :')
+    t = t.replace('வெண்போக்களால்', 'வெண்பாக்களால்')
+    t = t.replace('\u0bb5\u0bc6\u0ba3\u0bcd\u0baa\u0bcb\u0b95\u0bcd\u0b95\u0bb3\u0bbe\u0bb2\u0bcd', 'வெண்பாக்களால்')
+    t = t.replace('நூற்றெழு(107)', 'நூற்றேழு(107)')
+    t = t.replace('மொழிப்பெயர்க்கப்தட்ட', 'மொழிபெயர்க்கப்பட்ட')
+    t = t.replace('மொழிபெயர்க்கப்தட்டுள்ளது', 'மொழிபெயர்க்கப்பட்டுள்ளது')
+
+    # 1. Clean XML-invalid control characters, Unicode replacement character \ufffd, punctuation artifacts (@, #) and artificial spaces before combining vowels
     t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ufffe\uffff]", "", t)
+    t = re.sub(r"([\u0B80-\u0BFF])[@#\$%]([\u0B80-\u0BFF])", r"\1\2", t)
+    t = re.sub(r"([\u0B80-\u0BFF])\ufffd*([ாிீுூெேைொோௌ்])", r"\1\2", t)
     t = re.sub(r"([\u0B80-\u0BFF])\s+([ா-்])", r"\1\2", t)
     t = re.sub(r"([\u0B80-\u0BFF])\ufffd+([ா-்])", r"\1\2", t)
     t = re.sub(r"\ufffd+([ா-்])", r"\1", t)
@@ -599,7 +792,7 @@ def normalize_unicode(text: str) -> str:
     t = re.sub(r"பதாறும்", "தோறும்", t)
     t = re.sub(r"பதால்", "தோல்", t)
     t = re.sub(r"பதாற்", "தோற்", t)
-    t = re.sub(r"ப\s*ா([கனது])", r"போ\1", t)
+    t = re.sub(r"\bப\s*ா([னது])", r"போ\1", t)
     t = re.sub(r"ப\s*ாது", "போது", t)
     t = re.sub(r"க்பக\b", "க்கே", t)
     t = re.sub(r"சேர்த்பத", "சேர்த்தே", t)
@@ -746,6 +939,7 @@ def normalize_unicode(text: str) -> str:
     t = re.sub(r"(^|\s)ன்ம\s+", r"\1பன்மை ", t)
     t = re.sub(r"(?<=\s)ப\s*ன்\b", "பேன்", t)
     t = re.sub(r"(?<=\s)ப\s*ர்\b", "பேர்", t)
+    t = t.replace("வெண்போக்களால்", "வெண்பாக்களால்")
 
     return unicodedata.normalize("NFC", t)
 

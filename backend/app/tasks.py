@@ -1,6 +1,9 @@
 import io
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -464,8 +467,9 @@ def finalize_upload_sync(session_id: str) -> None:
             db.rollback()
             return
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        logger.exception("Upload finalization failed for session %s: %s", session_id, exc)
         session = db.query(UploadSession).filter(UploadSession.id == session_id).first()
         # Never delete an original that another finalizer already accepted (sha256 recorded).
         if session and session.status == "processing" and not session.sha256_hash:
