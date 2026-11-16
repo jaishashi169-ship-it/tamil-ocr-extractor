@@ -10,8 +10,5 @@
   NETLIFY = "true"
   NEXT_PUBLIC_API_URL = "/api/v1"
 
-[functions]
-  included_files = [
-    ".next/server/**/*",
-    ".next/required-server-files.json"
-  ]
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
