@@ -3,8 +3,8 @@ import { t, TRANSLATIONS } from "./i18n";
 import { CHUNK_SIZE_BYTES, MAX_UPLOAD_BYTES } from "./types";
 
 describe("Tamil English Document Studio frontend core", () => {
-  it("enforces exact 500 MB (500,000,000 bytes) upload limit", () => {
-    expect(MAX_UPLOAD_BYTES).toBe(500_000_000);
+  it("enforces exact 400 MB (400,000,000 bytes) upload limit", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(400_000_000);
     expect(CHUNK_SIZE_BYTES).toBe(5_242_880);
   });
 

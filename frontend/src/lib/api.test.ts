@@ -83,9 +83,9 @@ describe("Frontend API & chunked upload behavior", () => {
     expect(await ensureAuthToken()).toBe("manual-token");
   });
 
-  it("rejects files exceeding 500,000,000 bytes before initializing upload", async () => {
+  it("rejects files exceeding MAX_UPLOAD_BYTES before initializing upload", async () => {
     const oversized = { name: "huge.pdf", size: MAX_UPLOAD_BYTES + 1 } as File;
-    await expect(uploadFileInChunks(oversized, noopCallbacks)).rejects.toThrow("500 MB");
+    await expect(uploadFileInChunks(oversized, noopCallbacks)).rejects.toThrow("400 MB");
   });
 
   it("supports chunked upload, pause, and resume via /uploads endpoints", async () => {

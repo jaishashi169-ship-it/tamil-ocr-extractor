@@ -112,7 +112,7 @@ def init_upload(
     if payload.expected_size_bytes > settings.MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size ({payload.expected_size_bytes:,} bytes) exceeds the maximum allowed limit of {settings.MAX_UPLOAD_BYTES:,} bytes (500 MB).",
+            detail=f"File size ({payload.expected_size_bytes:,} bytes) exceeds the maximum allowed limit of {settings.MAX_UPLOAD_BYTES:,} bytes (400 MB).",
         )
 
     safe_name = sanitize_filename(payload.filename)
@@ -381,7 +381,7 @@ async def upload_chunk(
     if chunk_index not in (session.received_chunks or []) and current_bytes + len(data) > settings.MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Streamed bytes ({current_bytes + len(data):,}) exceed maximum allowed 500 MB ({settings.MAX_UPLOAD_BYTES:,} bytes).",
+            detail=f"Streamed bytes ({current_bytes + len(data):,}) exceed maximum allowed 400 MB ({settings.MAX_UPLOAD_BYTES:,} bytes).",
         )
 
     try:

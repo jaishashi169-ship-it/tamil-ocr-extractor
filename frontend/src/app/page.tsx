@@ -173,7 +173,7 @@ export default function HomePage() {
           status: "error",
           progressPercent: 0,
           uploadedBytes: 0,
-          error: `Exceeds 500 MB limit (${file.size.toLocaleString()} / ${MAX_UPLOAD_BYTES.toLocaleString()} bytes).`,
+          error: `Exceeds 400 MB limit (${file.size.toLocaleString()} / ${MAX_UPLOAD_BYTES.toLocaleString()} bytes).`,
         };
       }
       if (file.size === 0) {

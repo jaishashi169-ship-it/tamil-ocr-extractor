@@ -173,7 +173,7 @@ export async function uploadFileInChunks(
     throw new Error("Cannot upload an empty file (0 bytes).");
   }
   if (file.size > MAX_UPLOAD_BYTES) {
-    throw new Error(`File "${file.name}" (${file.size.toLocaleString()} bytes) exceeds the 500 MB (500,000,000 bytes) limit.`);
+    throw new Error(`File "${file.name}" (${file.size.toLocaleString()} bytes) exceeds the 400 MB (400,000,000 bytes) limit.`);
   }
 
   const token = await ensureAuthToken();

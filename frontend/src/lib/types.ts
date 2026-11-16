@@ -7,7 +7,7 @@ export type QualityPreset = "original" | "high" | "balanced" | "smallest" | "cus
 export type ConversionMode = "clean_editable" | "layout_preserved";
 export type Locale = "en" | "ta";
 
-export const MAX_UPLOAD_BYTES = 500_000_000;
+export const MAX_UPLOAD_BYTES = 400_000_000;
 export const CHUNK_SIZE_BYTES = 5_242_880;
 
 export interface UploadQueueItem {
