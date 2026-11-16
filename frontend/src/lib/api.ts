@@ -384,8 +384,8 @@ export async function uploadFileInChunks(
 
   return {
     sessionId: completed.session_id,
-    formatType: completed.format_type,
-    sha256: completed.sha256_hash,
+    formatType: completed.format_type || "bin",
+    sha256: completed.sha256_hash || "",
   };
 }
 
