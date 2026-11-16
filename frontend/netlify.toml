@@ -1,0 +1,13 @@
+# Netlify Configuration inside frontend
+
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"
+  NETLIFY = "true"
+  NEXT_PUBLIC_API_URL = "/api/v1"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
