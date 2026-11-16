@@ -9,7 +9,7 @@ const isCloudDeploy = Boolean(
 );
 
 const nextConfig: NextConfig = {
-  outputFileTracingRoot: path.join(__dirname),
+  outputFileTracingRoot: path.join(__dirname, ".."),
   outputFileTracingExcludes: {
     "*": [
       "../backend/**",
