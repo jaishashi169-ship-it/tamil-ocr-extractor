@@ -1,6 +1,8 @@
 export type WorkflowStep = "upload" | "options" | "review" | "download";
 export type WorkflowAction = "extract" | "convert" | "compress";
 export type OcrLanguage = "tam" | "eng" | "tam+eng";
+export type DocumentType = "printed" | "textbook" | "handwritten";
+export type OcrEngine = "auto" | "tesseract" | "gemini";
 export type QualityPreset = "original" | "high" | "balanced" | "smallest" | "custom";
 export type ConversionMode = "clean_editable" | "layout_preserved";
 export type Locale = "en" | "ta";
@@ -22,6 +24,8 @@ export interface UploadQueueItem {
 
 export interface JobSettings {
   language: OcrLanguage;
+  document_type?: DocumentType;
+  engine?: OcrEngine;
   conversion_mode: ConversionMode;
   workflow_action: WorkflowAction;
   target_output_format: string;
@@ -31,6 +35,7 @@ export interface JobSettings {
   denoise: boolean;
   enhance_contrast: boolean;
   multi_column: boolean;
+  force_ocr?: boolean;
 }
 
 export interface JobRecord {

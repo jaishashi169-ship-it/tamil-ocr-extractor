@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     UPLOAD_CHUNK_BYTES: int = 5_242_880  # 5 MB proxy chunks
     S3_MULTIPART_PART_BYTES: int = 8_388_608  # 8 MiB direct multipart part size (>= 5 MiB minimum)
     MAX_BATCH_FILES: int = 25
-    MAX_PDF_PAGES: int = 500
+    MAX_PDF_PAGES: int = 5000
     MAX_IMAGE_PIXELS: int = 100_000_000
     JOB_TIMEOUT_SECONDS: int = 1800
     JOB_LEASE_SECONDS: int = 300
@@ -49,8 +49,8 @@ class Settings(BaseSettings):
     DEFAULT_RETENTION_DAYS: int = 7
     RETENTION_CLEANUP_INTERVAL_SECONDS: int = 900  # Scheduled retention cleanup every 15 minutes
     # Atomic storage reservation limits (Note: Hobby 1 GB Blob cap / 850 MB budget does NOT guarantee a 500 MB document plus derived page previews and exports will fit concurrently)
-    USER_STORAGE_QUOTA_BYTES: int = 750_000_000  # 750 MB per user atomic reservation ceiling
-    TOTAL_STORAGE_BUDGET_BYTES: int = 850_000_000  # 850 MB total store atomic reservation ceiling (guards 1 GB Hobby cap)
+    USER_STORAGE_QUOTA_BYTES: int = 50_000_000_000  # 50 GB per user atomic reservation ceiling
+    TOTAL_STORAGE_BUDGET_BYTES: int = 50_000_000_000  # 50 GB total store atomic reservation ceiling
 
     # Production readiness & restricted smoke-test upload gating
     REQUIRE_READINESS_FOR_UPLOADS: bool = False  # Always enforced when APP_ENV == "production"

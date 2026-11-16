@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import subprocess
 import uuid
@@ -6,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import httpx
 import numpy as np
 import pytesseract
 from PIL import Image
@@ -31,6 +34,9 @@ class OCROptions:
     enhance_contrast: bool = True
     multi_column: bool = True
     crop_box: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h in pixels
+    document_type: str = "printed"  # printed | textbook | handwritten
+    engine: str = "auto"  # auto | tesseract | gemini
+    force_ocr: bool = False
 
 
 def get_ocr_status() -> Dict[str, Any]:
@@ -119,8 +125,24 @@ def _deskew_image(gray: np.ndarray) -> np.ndarray:
     return cv2.warpAffine(gray, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
+def _suppress_gutter_shadows(gray: np.ndarray) -> np.ndarray:
+    """Detect and whiten dark gutter binding shadows along outer vertical margins in textbook scans."""
+    h, w = gray.shape[:2]
+    out = gray.copy()
+    page_med = float(np.median(gray))
+    if page_med > 90 and w > 100:
+        margin_w = max(10, int(w * 0.06))
+        left_band = gray[:, :margin_w]
+        if np.mean(left_band) < page_med * 0.45:
+            out[:, :margin_w] = 255
+        right_band = gray[:, -margin_w:]
+        if np.mean(right_band) < page_med * 0.45:
+            out[:, -margin_w:] = 255
+    return out
+
+
 def preprocess_for_ocr(image_bgr: np.ndarray, opts: OCROptions) -> np.ndarray:
-    """Apply optional crop, rotation, deskew, denoise, and contrast enhancement."""
+    """Apply optional crop, rotation, deskew, denoise, handwriting enhancement, and contrast enhancement."""
     img = image_bgr
     if opts.crop_box:
         x, y, w, h = opts.crop_box
@@ -146,15 +168,32 @@ def preprocess_for_ocr(image_bgr: np.ndarray, opts: OCROptions) -> np.ndarray:
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
-    if opts.denoise:
+    # Textbook specific preprocessing: suppress spine gutter shadows
+    if opts.document_type == "textbook":
+        gray = _suppress_gutter_shadows(gray)
+
+    # Handwritten specific preprocessing: bilateral filter removes paper fibers and notebook lines without blurring ink strokes
+    if opts.document_type == "handwritten":
+        gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+
+    if opts.denoise and opts.document_type != "handwritten":
         gray = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
 
     if opts.enhance_contrast:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clip = 2.5 if opts.document_type == "handwritten" else 2.0
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
 
     if opts.deskew:
         gray = _deskew_image(gray)
+
+    if opts.document_type == "handwritten":
+        # Adaptive Gaussian thresholding for varying ink pressure and thin cursive strokes
+        adaptive = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 11
+        )
+        kernel = np.ones((2, 2), np.uint8)
+        gray = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
 
     return gray
 
@@ -191,15 +230,130 @@ def _order_blocks_reading_order(blocks: List[TextBlock], page_width: int, multi_
     return sorted(blocks, key=lambda b: (b.bbox.y if b.bbox else 0.0, b.bbox.x if b.bbox else 0.0))
 
 
-def run_ocr_on_image(
+def run_gemini_vision_ocr(
     image_path: Path,
     filename: str,
     page_number: int,
     opts: OCROptions,
 ) -> Tuple[List[TextBlock], Optional[float], List[str]]:
     """
-    Run Tesseract OCR on an image file and return (TextBlocks, average_confidence, warnings).
+    Execute high-accuracy multimodal Vision OCR using Gemini 2.0 Flash.
+    Specialized for Tamil & English handwriting, textbooks, poetry verses, and complex layouts.
     """
+    settings = get_settings()
+    api_key = (settings.GEMINI_API_KEY or "").strip()
+    if not api_key:
+        raise OCRUnavailableError("GEMINI_API_KEY is not configured on the server.")
+
+    warnings: List[str] = []
+    with open(image_path, "rb") as img_f:
+        img_bytes = img_f.read()
+    b64_data = base64.b64encode(img_bytes).decode("utf-8")
+
+    ext = image_path.suffix.lower()
+    mime_type = "image/png" if ext == ".png" else "image/jpeg"
+
+    system_prompt = (
+        "You are an expert bilingual Tamil and English Optical Character Recognition (OCR) and transcription engine.\n"
+        "Your task is to accurately extract all text from the provided document image with 100% language fidelity.\n"
+        "CRITICAL RULES:\n"
+        "1. Language Fidelity: Extract both Tamil (தமிழ்) and English words exactly as written, preserving original words, technical terms, names, and numbers without translation or omission.\n"
+        "2. Handwriting Recognition: If the document is handwritten (Tamil handwriting, cursive English, student notebooks, answer scripts), decipher every character and ligature with high precision.\n"
+        "3. Textbooks & Layouts: Preserve multi-column reading order (read column 1 top-to-bottom, then column 2), chapter headings, subheadings, bullet lists, and tables.\n"
+        "4. Tamil Poetry & Verses: For couplets (Thirukkural), Sangam literature (செய்யுள்), and poems, strictly preserve the exact verse lines and stanza breaks.\n"
+        "5. Output Unicode: Return clean, standard Unicode UTF-8 NFC text.\n"
+        "Return ONLY valid JSON matching this schema:\n"
+        "{\n"
+        '  "blocks": [\n'
+        '    {\n'
+        '      "text": "exact extracted paragraph, verse or heading text",\n'
+        '      "block_type": "paragraph" | "heading" | "verse" | "list_item",\n'
+        '      "heading_level": 1 | 2 | 3 | null,\n'
+        '      "language": "tam" | "eng" | "tam+eng",\n'
+        '      "confidence": 98.0\n'
+        '    }\n'
+        '  ],\n'
+        '  "confidence_avg": 98.0\n'
+        "}"
+    )
+
+    doc_style = f"Document type: {opts.document_type}." if opts.document_type else "Document type: printed."
+    user_prompt = f"Transcribe all Tamil and English text on page {page_number} of '{filename}'. {doc_style} Language preference: {opts.language}."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"inlineData": {"mimeType": mime_type, "data": b64_data}},
+                    {"text": user_prompt},
+                ],
+            }
+        ],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        res_json = resp.json()
+
+    candidates = res_json.get("candidates") or []
+    if not candidates:
+        raise ValueError("Gemini returned no candidates.")
+    raw_text = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
+
+    parsed = json.loads(raw_text)
+    raw_blocks = parsed.get("blocks", [])
+
+    with Image.open(image_path) as im:
+        iw, ih = im.size
+
+    blocks: List[TextBlock] = []
+    confs: List[float] = []
+    n_blocks = max(1, len(raw_blocks))
+    block_h = ih / n_blocks
+
+    for idx, b in enumerate(raw_blocks):
+        b_text = normalize_unicode(b.get("text", "").strip())
+        if not b_text:
+            continue
+        c = float(b.get("confidence", 98.0))
+        confs.append(c)
+        b_type = b.get("block_type", "paragraph")
+        if b_type not in {"heading", "paragraph", "list_item", "table_cell", "caption", "header_footer", "verse"}:
+            b_type = "paragraph"
+        b_id = str(uuid.uuid4())
+        y_pos = idx * block_h
+        bbox = BoundingBox(x=0.0, y=y_pos, width=float(iw), height=block_h)
+        blocks.append(
+            TextBlock(
+                id=b_id,
+                block_type=b_type,
+                heading_level=b.get("heading_level"),
+                text=b_text,
+                raw_ocr_text=b_text,
+                language=b.get("language") or detect_script_language(b_text),
+                extraction_method="gemini_vision",
+                confidence=c,
+                bbox=bbox,
+                source_ref=SourceReference(filename=filename, page_number=page_number, block_id=b_id, bbox=bbox),
+            )
+        )
+
+    avg_conf = round(sum(confs) / len(confs), 2) if confs else 98.0
+    return blocks, avg_conf, warnings
+
+
+def _run_tesseract_ocr(
+    image_path: Path,
+    filename: str,
+    page_number: int,
+    opts: OCROptions,
+) -> Tuple[List[TextBlock], Optional[float], List[str]]:
+    """Run Tesseract OCR on an image file with document-type-optimized PSM and character models."""
     warnings: List[str] = []
     Image.MAX_IMAGE_PIXELS = settings.MAX_IMAGE_PIXELS
 
@@ -225,11 +379,19 @@ def run_ocr_on_image(
             f"Required Tesseract language pack(s) missing: {', '.join(missing_langs)}. Installed: {', '.join(installed) or 'none'}."
         )
 
+    # Document-type-optimized Page Segmentation Mode (PSM)
+    if opts.document_type == "handwritten":
+        psm_config = "--psm 6"  # Uniform block of text prevents fragmentation of handwriting
+    elif opts.document_type == "textbook":
+        psm_config = "--psm 3" if opts.multi_column else "--psm 4"
+    else:
+        psm_config = "--psm 3"
+
     try:
         data = pytesseract.image_to_data(
             processed,
             lang=lang_arg,
-            config="--psm 3",
+            config=psm_config,
             output_type=pytesseract.Output.DICT,
         )
     except pytesseract.TesseractNotFoundError as exc:
@@ -237,7 +399,6 @@ def run_ocr_on_image(
     except pytesseract.TesseractError as exc:
         raise OCRUnavailableError(f"Tesseract OCR failed: {exc}") from exc
 
-    # Group words into paragraphs (block_num, par_num)
     para_map: dict[tuple[int, int], dict] = {}
     n_items = len(data.get("text", []))
     for i in range(n_items):
@@ -290,10 +451,19 @@ def run_ocr_on_image(
             height=max(1.0, entry["y2"] - entry["y1"]),
         )
         block_id = str(uuid.uuid4())
+
+        # Detect Tamil poetry/verse layout (e.g. Thirukkural couplets or short poem lines)
+        block_type = "paragraph"
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) >= 2:
+            avg_words = sum(len(ln.split()) for ln in lines) / len(lines)
+            if avg_words <= 6.5 and all(len(ln) < 55 for ln in lines):
+                block_type = "verse"
+
         blocks.append(
             TextBlock(
                 id=block_id,
-                block_type="paragraph",
+                block_type=block_type,
                 text=text,
                 raw_ocr_text=text,
                 language=detect_script_language(text),
@@ -312,3 +482,48 @@ def run_ocr_on_image(
     ordered = _order_blocks_reading_order(blocks, processed.shape[1], opts.multi_column)
     page_conf = round(sum(all_confs) / len(all_confs), 2) if all_confs else None
     return ordered, page_conf, warnings
+
+
+def run_ocr_on_image(
+    image_path: Path,
+    filename: str,
+    page_number: int,
+    opts: OCROptions,
+) -> Tuple[List[TextBlock], Optional[float], List[str]]:
+    """
+    Unified OCR runner supporting intelligent routing between Multimodal Vision AI (Gemini)
+    and enhanced local Tesseract with handwriting/textbook preprocessing.
+    """
+    warnings: List[str] = []
+    settings = get_settings()
+    has_gemini = bool(settings.GEMINI_API_KEY and settings.GEMINI_API_KEY.strip())
+
+    should_use_gemini = False
+    if opts.engine == "gemini":
+        should_use_gemini = True
+    elif opts.engine == "auto":
+        # In auto mode, use Gemini Vision for handwritten documents when API key is configured
+        if has_gemini and opts.document_type == "handwritten":
+            should_use_gemini = True
+
+    if should_use_gemini and has_gemini:
+        try:
+            return run_gemini_vision_ocr(image_path, filename, page_number, opts)
+        except Exception as exc:
+            warnings.append(f"Gemini Vision OCR attempt failed ({exc}); falling back to local Tesseract.")
+
+    # Execute enhanced local Tesseract OCR
+    blocks, conf, t_warns = _run_tesseract_ocr(image_path, filename, page_number, opts)
+    warnings.extend(t_warns)
+
+    # Intelligent fallback: If Tesseract yielded very low confidence (< 45%) or 0 blocks on handwritten/textbook documents, upgrade via Gemini Vision
+    if has_gemini and (conf is None or conf < 45.0 or len(blocks) == 0):
+        try:
+            g_blocks, g_conf, g_warns = run_gemini_vision_ocr(image_path, filename, page_number, opts)
+            warnings.append("Low-confidence Tesseract result automatically upgraded via Gemini Vision OCR.")
+            warnings.extend(g_warns)
+            return g_blocks, g_conf, warnings
+        except Exception:
+            pass
+
+    return blocks, conf, warnings

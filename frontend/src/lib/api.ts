@@ -429,7 +429,17 @@ export async function reviewPageGrammar(jobId: string, pageNumber: number) {
 export async function reprocessPage(
   jobId: string,
   pageNumber: number,
-  options: { language: string; crop_box?: [number, number, number, number] }
+  options: {
+    language?: string;
+    crop_box?: [number, number, number, number];
+    document_type?: string;
+    engine?: string;
+    auto_rotate?: boolean;
+    deskew?: boolean;
+    denoise?: boolean;
+    enhance_contrast?: boolean;
+    multi_column?: boolean;
+  }
 ) {
   return apiFetch<{ text: string; confidence_avg?: number; warnings: string[] }>(
     `/jobs/${jobId}/pages/${pageNumber}/reprocess`,
@@ -468,11 +478,21 @@ export async function applyHeadersFooters(jobId: string, headers: string[], foot
 async function pollExportUntilReady(jobId: string, artifactId: string): Promise<ExportArtifactRecord> {
   const deadline = Date.now() + 300_000;
   while (true) {
-    const art = await apiFetch<ExportArtifactRecord>(`/jobs/${jobId}/exports/${artifactId}`);
-    if (art.status === "completed") return art;
-    if (art.status === "failed") throw new Error("Export generation failed");
+    try {
+      const art = await apiFetch<ExportArtifactRecord>(`/jobs/${jobId}/exports/${artifactId}`);
+      if (art.status === "completed") return art;
+      if (art.status === "failed") {
+        const warningMsg = (art.warnings && art.warnings.length > 0) ? art.warnings.join("; ") : "Export generation failed";
+        throw new Error(warningMsg);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.toLowerCase().includes("processing") && !msg.includes("409")) {
+        throw err;
+      }
+    }
     if (Date.now() > deadline) throw new Error("Export generation timed out");
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 500));
   }
 }
 

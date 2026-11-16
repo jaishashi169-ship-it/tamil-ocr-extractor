@@ -57,6 +57,13 @@ def export_docx(doc: DocumentModel, options: Dict[str, Any]) -> Tuple[bytes, Lis
                 p = word.add_paragraph(txt, style="List Bullet")
                 for r in p.runs:
                     r.font.name = "Noto Sans Tamil"
+            elif blk.block_type == "verse":
+                p = word.add_paragraph(txt)
+                p.paragraph_format.left_indent = Pt(28)
+                p.paragraph_format.line_spacing = 1.2
+                for r in p.runs:
+                    r.font.name = "Noto Sans Tamil"
+                    r.italic = True
             else:
                 p = word.add_paragraph(txt)
                 for r in p.runs:

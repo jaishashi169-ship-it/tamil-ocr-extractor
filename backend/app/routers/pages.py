@@ -34,6 +34,8 @@ class ReprocessPageRequest(BaseModel):
     enhance_contrast: bool = True
     multi_column: bool = True
     crop_box: Optional[List[int]] = None  # [x, y, w, h] in pixels
+    document_type: str = "printed"  # printed | textbook | handwritten
+    engine: str = "auto"  # auto | tesseract | gemini
 
 
 class LegacyTamilRequest(BaseModel):
@@ -81,8 +83,8 @@ def get_job_pages(
                 "extraction_method": p.extraction_method,
                 "language_detected": p.language_detected,
                 "confidence_avg": p.confidence_avg,
-                "raw_text": p.raw_text,
-                "edited_text": p.edited_text if p.edited_text is not None else p.raw_text,
+                "raw_text": normalize_unicode(p.raw_text) if p.raw_text else "",
+                "edited_text": normalize_unicode(p.edited_text if p.edited_text is not None else (p.raw_text or "")),
                 "has_user_edits": p.edited_text is not None and p.edited_text != p.raw_text,
                 "draft_version": drafts_by_page.get(p.page_number, 0),
                 "has_preview": bool(p.preview_key),
@@ -227,6 +229,8 @@ def reprocess_page_or_region(
         enhance_contrast=payload.enhance_contrast,
         multi_column=payload.multi_column,
         crop_box=crop_tuple,
+        document_type=payload.document_type,
+        engine=payload.engine,
     )
     preview_path = storage.get_local_file(page.preview_key)
     try:

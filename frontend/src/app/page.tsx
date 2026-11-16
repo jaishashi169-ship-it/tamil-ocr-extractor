@@ -44,6 +44,8 @@ export default function HomePage() {
 
   const [settings, setSettings] = useState<JobSettings>({
     language: "tam+eng",
+    document_type: "printed",
+    engine: "auto",
     conversion_mode: "clean_editable",
     workflow_action: "extract",
     target_output_format: "docx",
@@ -53,6 +55,7 @@ export default function HomePage() {
     denoise: false,
     enhance_contrast: true,
     multi_column: true,
+    force_ocr: false,
   });
   const [password, setPassword] = useState("");
   const [isStarting, setIsStarting] = useState(false);
@@ -433,6 +436,7 @@ export default function HomePage() {
           job={activeJob}
           batchJobIds={batchJobIds}
           initialArtifact={latestArtifact}
+          pages={pages}
           onArtifactCreated={setLatestArtifact}
           onBackToReview={() => setStep("review")}
         />

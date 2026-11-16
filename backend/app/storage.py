@@ -14,6 +14,8 @@ from vercel._internal.core.session import get_active_sync_session
 from vercel.blob import sync as vercel_blob_sync
 from vercel.blob.errors import BlobNotFoundError
 
+from urllib.parse import quote
+
 from app.config import get_settings
 from app.security import safe_join
 
@@ -407,8 +409,10 @@ class PrivateStorage:
         clean_key = key.lstrip("/")
         base_headers: Dict[str, str] = {"Accept-Ranges": "bytes"}
         if filename:
-            safe_disp_name = filename.replace('"', "")
-            base_headers["Content-Disposition"] = f'{disposition}; filename="{safe_disp_name}"'
+            # RFC 5987 / RFC 6266: Use Latin-1 safe ASCII fallback for filename and UTF-8 encoded filename* for international characters
+            ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_").replace('"', "")
+            encoded_name = quote(filename.replace('"', ""), encoding="utf-8")
+            base_headers["Content-Disposition"] = f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
 
         if self.is_vercel_blob():
             self._sync_blob_sdk_env()

@@ -115,6 +115,9 @@ def process_extraction_job_sync(
             denoise=bool(settings_dict.get("denoise", False)),
             enhance_contrast=bool(settings_dict.get("enhance_contrast", True)),
             multi_column=bool(settings_dict.get("multi_column", True)),
+            document_type=str(settings_dict.get("document_type", "printed")),
+            engine=str(settings_dict.get("engine", "auto")),
+            force_ocr=bool(settings_dict.get("force_ocr", False)),
         )
 
         original_key_for_scratch_cleanup = job.original_storage_key

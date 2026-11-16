@@ -140,8 +140,32 @@ def import_pdf(
                 pass
 
             page_warnings: List[str] = []
-            # If embedded text is sparse (< 25 non-space chars), apply OCR to this page only
+
+            # Check if embedded text appears to be legacy non-Unicode font gibberish (e.g. Bamini, TAB, PageMaker)
+            combined_embedded = " ".join(b.text for b in embedded_blocks)
+            is_legacy_gibberish = False
             if embedded_char_count >= 25:
+                import re
+
+                bamini_markers = ["jkpo;", "vd;id", "ghh;it", "epiy", "nkhop", "vz;", "jfty;", "murhiz", "tpsf;fk;"]
+                lower_emb = combined_embedded.lower()
+                has_bamini_words = any(m in lower_emb for m in bamini_markers)
+                has_dense_semicolons = len(re.findall(r"[a-zA-Z];[a-zA-Z]", combined_embedded)) >= 3
+                if has_bamini_words or has_dense_semicolons:
+                    is_legacy_gibberish = True
+                    page_warnings.append(
+                        "Detected legacy non-Unicode font encoding in PDF; applying visual OCR for authentic Unicode reproduction."
+                    )
+
+            # Determine whether to run visual OCR on this page
+            should_run_ocr = (
+                embedded_char_count < 25
+                or ocr_opts.force_ocr
+                or ocr_opts.document_type == "handwritten"
+                or is_legacy_gibberish
+            )
+
+            if not should_run_ocr:
                 extraction_method = "direct"
                 source_type = "pdf_text"
                 final_blocks = embedded_blocks
@@ -157,14 +181,15 @@ def import_pdf(
                 finally:
                     storage.delete_key(ocr_img_key)
 
-                if embedded_blocks and not ocr_blocks:
+                if embedded_blocks and not ocr_blocks and not is_legacy_gibberish:
                     final_blocks = embedded_blocks
                     extraction_method = "direct"
                     source_type = "pdf_text"
                 else:
                     final_blocks = ocr_blocks
-                    extraction_method = "ocr"
-                    source_type = "pdf_scanned"
+                    first_method = final_blocks[0].extraction_method if final_blocks else "ocr"
+                    extraction_method = "gemini_vision" if first_method == "gemini_vision" else "ocr"
+                    source_type = "pdf_scanned" if embedded_char_count < 25 else "pdf_mixed"
 
             combined_text = "\n".join(b.text for b in final_blocks)
             lang_detected = detect_script_language(combined_text)

@@ -133,8 +133,6 @@ def get_export_status(
     )
     if not art:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export artifact not found")
-    if art.status != "completed" or not art.storage_key:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Export is not ready (status: {art.status})")
     return _serialize_artifact(art)
 
 

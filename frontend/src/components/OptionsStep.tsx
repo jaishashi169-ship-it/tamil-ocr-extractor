@@ -4,7 +4,7 @@ import React, { useState } from "react";
 import { ChevronDown, ChevronUp, FileCheck2, Lock, Play } from "lucide-react";
 import { formatBytes } from "@/lib/api";
 import { t } from "@/lib/i18n";
-import { JobSettings, OcrLanguage, QualityPreset, UploadQueueItem } from "@/lib/types";
+import { DocumentType, JobSettings, OcrEngine, OcrLanguage, QualityPreset, UploadQueueItem } from "@/lib/types";
 import { useStudio } from "./StudioContext";
 
 interface OptionsStepProps {
@@ -102,6 +102,56 @@ export function OptionsStep({
           </div>
         </div>
 
+        {/* Document Style & Content Type */}
+        <div>
+          <label className="block text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">
+            Document Style & Source Type
+          </label>
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+            {[
+              {
+                id: "printed" as DocumentType,
+                title: "Standard Printed",
+                desc: "Typed docs, letters, forms & digital papers",
+                badge: "Tesseract / Auto",
+              },
+              {
+                id: "textbook" as DocumentType,
+                title: "Textbooks & Guides",
+                desc: "School/college books, TNPSC guides, multi-column & gutter fix",
+                badge: "Layout + Gutter Fix",
+              },
+              {
+                id: "handwritten" as DocumentType,
+                title: "Handwritten Notes",
+                desc: "Tamil & English cursive, notebooks, exam answers & manuscripts",
+                badge: "Stroke Enhancer + Vision AI",
+              },
+            ].map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => onChangeSettings({ ...settings, document_type: opt.id })}
+                className={`flex flex-col text-left rounded-xl border p-3 transition-colors ${
+                  (settings.document_type || "printed") === opt.id
+                    ? "border-indigo-600 bg-indigo-50/80 ring-1 ring-indigo-600 text-indigo-900 dark:bg-indigo-950/70 dark:text-indigo-200"
+                    : "border-slate-200 text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-xs sm:text-sm">{opt.title}</span>
+                  <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300">
+                    {opt.badge}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] leading-snug text-slate-500 dark:text-slate-400">
+                  {opt.desc}
+                </p>
+              </button>
+            ))}
+          </div>
+        </div>
+
         {/* Output Format */}
         <div>
           <label htmlFor="output-format-select" className="block text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">
@@ -169,6 +219,7 @@ export function OptionsStep({
                   { key: "enhance_contrast", label: "Enhance contrast (CLAHE)" },
                   { key: "denoise", label: "Denoise grainy scans" },
                   { key: "multi_column", label: "Detect multi-column reading order" },
+                  { key: "force_ocr", label: "Force full visual OCR (Bypass PDF embedded text - for scans/legacy fonts)" },
                 ].map((chk) => (
                   <label key={chk.key} className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300">
                     <input
@@ -180,6 +231,26 @@ export function OptionsStep({
                     <span>{chk.label}</span>
                   </label>
                 ))}
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                  OCR Engine
+                </label>
+                <select
+                  value={settings.engine || "auto"}
+                  onChange={(e) =>
+                    onChangeSettings({
+                      ...settings,
+                      engine: e.target.value as OcrEngine,
+                    })
+                  }
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-800"
+                >
+                  <option value="auto">Auto (Gemini Vision AI for handwriting + Enhanced Tesseract)</option>
+                  <option value="tesseract">Local Tesseract Engine (Offline & Fast)</option>
+                  <option value="gemini">Gemini Multimodal Vision AI (Maximum Handwriting & Textbook Accuracy)</option>
+                </select>
               </div>
 
               <div>

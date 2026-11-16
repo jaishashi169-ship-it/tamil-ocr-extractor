@@ -31,7 +31,7 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     role = Column(String(32), nullable=False, default="user")  # user | admin
-    storage_quota_bytes = Column(BigInteger, nullable=False, default=750_000_000)
+    storage_quota_bytes = Column(BigInteger, nullable=False, default=50_000_000_000)
     retention_days = Column(Integer, nullable=False, default=7)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
@@ -212,7 +212,7 @@ class StorageBudgetState(Base):
     __tablename__ = "storage_budget_state"
 
     id = Column(Integer, primary_key=True, default=1)
-    total_budget_bytes = Column(BigInteger, nullable=False, default=850_000_000)
+    total_budget_bytes = Column(BigInteger, nullable=False, default=50_000_000_000)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
