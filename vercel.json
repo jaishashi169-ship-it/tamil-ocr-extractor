@@ -2,10 +2,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "backend/app/main.py": {
-      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,private_storage/**,*.db,*.sqlite*,sample-data/**,samples/**,docs/**,scripts/**,.venv/**,venv/**}"
+      "excludeFiles": "{backend/tests/**,backend/alembic/**,docs/**,samples/**,**/*.md,**/*.pyc,__pycache__/**,.venv/**,**/*.sqlite,**/*.db,**/*.png,**/*.jpg,**/*.jpeg,**/*.pdf,**/*.zip,backend/private_storage/**,private_storage/**}"
     },
     "app/main.py": {
-      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,private_storage/**,*.db,*.sqlite*,sample-data/**,samples/**,docs/**,scripts/**,.venv/**,venv/**}"
+      "excludeFiles": "{backend/tests/**,backend/alembic/**,docs/**,samples/**,**/*.md,**/*.pyc,__pycache__/**,.venv/**,**/*.sqlite,**/*.db,**/*.png,**/*.jpg,**/*.jpeg,**/*.pdf,**/*.zip,backend/private_storage/**,private_storage/**}"
     }
   },
   "services": {
