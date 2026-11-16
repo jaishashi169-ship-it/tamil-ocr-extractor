@@ -12,7 +12,7 @@ from app.auth import (
 )
 from app.config import get_settings
 from app.database import get_db
-from app.dispatch import dispatch_celery_or_fallback
+from app.dispatch import dispatch_celery_or_fallback, is_broker_reachable
 from app.models import StorageReservation, UploadSession, User
 from app.security import sanitize_filename
 from app.services.retention import (
@@ -422,6 +422,22 @@ def get_upload_status(
     )
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+
+    # In local development without a running Celery worker daemon, auto-finalize on polling
+    if (
+        session.status == "processing"
+        and not session.sha256_hash
+        and settings.APP_ENV != "production"
+        and settings.ALLOW_BACKGROUND_TASK_FALLBACK
+        and not is_broker_reachable(settings.CELERY_BROKER_URL, 0.05, 0.1)
+    ):
+        try:
+            from app.tasks import finalize_upload_sync
+            finalize_upload_sync(session.id)
+            db.refresh(session)
+        except Exception:
+            pass
+
     mode = storage.direct_upload_mode() if session.s3_upload_id else "proxy"
     received_bytes = (
         session.expected_size_bytes

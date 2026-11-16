@@ -362,12 +362,15 @@ export async function uploadFileInChunks(
     }
   }
 
-  const deadline = Date.now() + 300_000;
+  // Generous timeout (1 hour) to support large files up to 500 MB without timing out
+  const deadline = Date.now() + 3_600_000;
+  let pollInterval = 1000;
   while (completed.status === "processing") {
     if (Date.now() > deadline) {
-      throw new Error("Upload finalization timed out");
+      throw new Error("Upload finalization timed out. Please refresh or retry.");
     }
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, pollInterval));
+    pollInterval = Math.min(2500, pollInterval + 300);
     completed = await apiFetch<{
       session_id: string;
       status: string;
