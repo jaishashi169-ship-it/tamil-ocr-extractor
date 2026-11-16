@@ -1,5 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "backend/app/main.py": {
+      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,private_storage/**,*.db,*.sqlite*,sample-data/**,samples/**,docs/**,scripts/**,.venv/**,venv/**}"
+    },
+    "app/main.py": {
+      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,private_storage/**,*.db,*.sqlite*,sample-data/**,samples/**,docs/**,scripts/**,.venv/**,venv/**}"
+    }
+  },
   "services": {
     "backend": {
       "root": "backend",
