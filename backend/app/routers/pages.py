@@ -116,7 +116,29 @@ def get_page_image(
     if not page:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
     key = page.preview_key if kind == "preview" else page.thumbnail_key
-    if not key:
+    target_key = key or f"jobs/{job_id}/pages/page_{page_number:04d}_{kind}.png"
+    target_path = storage.local_path_for(target_key)
+    if not target_path.exists() and job.format_type == "pdf" and job.original_storage_key:
+        try:
+            import fitz
+            pdf_path = storage.get_local_file(job.original_storage_key)
+            doc = fitz.open(str(pdf_path))
+            if 0 <= page_number - 1 < len(doc):
+                fitz_page = doc[page_number - 1]
+                dpi = 150 if kind == "preview" else 48
+                pix = fitz_page.get_pixmap(dpi=dpi)
+                storage.save_bytes(target_key, pix.tobytes("png"))
+                if kind == "preview":
+                    page.preview_key = target_key
+                else:
+                    page.thumbnail_key = target_key
+                db.commit()
+            doc.close()
+        except Exception:
+            pass
+
+    key = target_key
+    if not storage.local_path_for(key).exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No visual preview available for this page")
     try:
         stream_info = storage.open_download_stream(
@@ -136,6 +158,28 @@ def get_page_image(
         media_type=stream_info["media_type"],
         headers=stream_info["headers"],
     )
+
+
+@router.get("/{job_id}/pages/{page_number}/preview")
+def get_page_preview(
+    job_id: str,
+    page_number: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_page_image(job_id, page_number, request, kind="preview", current_user=current_user, db=db)
+
+
+@router.get("/{job_id}/pages/{page_number}/thumbnail")
+def get_page_thumbnail(
+    job_id: str,
+    page_number: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_page_image(job_id, page_number, request, kind="thumbnail", current_user=current_user, db=db)
 
 
 @router.put("/{job_id}/pages/{page_number}")

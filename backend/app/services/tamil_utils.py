@@ -777,6 +777,7 @@ def normalize_unicode(text: str) -> str:
 
     # 1. Clean XML-invalid control characters, Unicode replacement character \ufffd, punctuation artifacts (@, #) and artificial spaces before combining vowels
     t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ufffe\uffff]", "", t)
+    t = re.sub(r"[\ufffd@](?=[\u0bca\u0bcb\u0bcc\u0bc6\u0bc7\u0bc8\u0bbe\u0bbf\u0bc0\u0bc1\u0bc2\u0bcd])", "", t)
     t = re.sub(r"([\u0B80-\u0BFF])[@#\$%]([\u0B80-\u0BFF])", r"\1\2", t)
     t = re.sub(r"([\u0B80-\u0BFF])\ufffd*([ாிீுூெேைொோௌ்])", r"\1\2", t)
     t = re.sub(r"([\u0B80-\u0BFF])\s+([ா-்])", r"\1\2", t)

@@ -149,3 +149,41 @@ def test_extraction_kit_integration():
     assert "இந்நூல் 400 பாடல்களைக் கொண்டது." in p2_text
 
     assert all(s["text"].splitlines()[-1] == str(i) for i, s in enumerate(sections, 2))
+
+
+def test_thirukural_font_profile_extraction():
+    """Verify font profile extraction on TAMIL PART 2 - 01 திருக்குறள்.pdf."""
+    from app.services.extraction_kit import extract, issues
+    import glob
+
+    pdf_matches = glob.glob("**/TAMIL PART 2 - 01*.pdf", recursive=True)
+    if not pdf_matches:
+        return
+
+    sections = extract(pdf_matches[0], lang="tam+eng", mode="auto")
+    assert len(sections) == 38
+    assert all(s["method"] == "verified-file font profile" for s in sections)
+    assert not any(issues(s["text"]) for s in sections)
+
+    p1_text = sections[0]["text"]
+    assert "திருக்குறள்" in p1_text
+    assert "திருக்குறள் – திரு+குறள்" in p1_text
+    assert "இரண்டு அடிகளாலான குறள் வெண்பாக்களால் ஆனது." in p1_text
+    assert "திருக்குறளை திருவள்ளுவர் எழுதினார்." in p1_text
+    assert "திருக்குறள் முப்பால்களை கொண்டது." in p1_text
+    assert "அறத்துப்பால் - 38 அதிகாரங்கள்" in p1_text
+
+
+def test_tau_font_normalization():
+    """Verify normalization of TAU-Mullai/TAU-Paalai font glyph artifacts."""
+    from app.services.tamil_utils import normalize_unicode
+
+    raw = "ப\ufffdொருந்தியதும் க\ufffdொண்டதும் ச@ொல்லும் ப\ufffdோற்றும் ர\ufffdௌலட்"
+    cleaned = normalize_unicode(raw)
+    assert "பொருந்தியதும்" in cleaned
+    assert "கொண்டதும்" in cleaned
+    assert "சொல்லும்" in cleaned
+    assert "போற்றும்" in cleaned
+    assert "ரௌலட்" in cleaned
+    assert "\ufffd" not in cleaned
+    assert "@" not in cleaned

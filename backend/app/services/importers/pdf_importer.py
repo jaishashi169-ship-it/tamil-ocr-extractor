@@ -106,12 +106,18 @@ def import_pdf(
             rect = page.rect
 
             # Render preview & thumbnail for Review UI
-            preview_pix = page.get_pixmap(dpi=150)
             preview_key = f"jobs/{job_id}/pages/page_{page_num:04d}_preview.png"
-            storage.save_bytes(preview_key, preview_pix.tobytes("png"))
+            thumb_key = f"jobs/{job_id}/pages/page_{page_num:04d}_thumb.png"
+
+            # For small documents (<= 25 pages), render full preview immediately.
+            # For large documents (> 25 pages), render preview for first 10 pages immediately so Review opens instantly;
+            # subsequent pages render on-demand via /jobs/{job_id}/pages/{page_num}/preview to prevent multi-minute blocking.
+            should_render_preview = (total_pages <= 25) or (page_num <= 10)
+            if should_render_preview:
+                preview_pix = page.get_pixmap(dpi=150)
+                storage.save_bytes(preview_key, preview_pix.tobytes("png"))
 
             thumb_pix = page.get_pixmap(dpi=48)
-            thumb_key = f"jobs/{job_id}/pages/page_{page_num:04d}_thumb.png"
             storage.save_bytes(thumb_key, thumb_pix.tobytes("png"))
 
             page_warnings: List[str] = []

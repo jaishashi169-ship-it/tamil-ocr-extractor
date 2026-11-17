@@ -139,7 +139,17 @@ def process_extraction_job_sync(
             if h.hexdigest() != job.file_sha256:
                 raise CorruptFileError("Original file integrity check (SHA-256) failed; file may have been modified.")
 
+        _last_progress_mono = 0.0
+
         def _on_progress(current_page: int, total_pages: int, label: str) -> None:
+            nonlocal _last_progress_mono
+            now_mono = time.monotonic()
+            is_first = (current_page == 1)
+            is_last = (current_page == total_pages)
+            if not is_first and not is_last and (now_mono - _last_progress_mono < 0.4) and (current_page % 5 != 0):
+                return
+            _last_progress_mono = now_mono
+
             hb_now = datetime.now(timezone.utc)
             new_lease = hb_now + timedelta(seconds=settings.JOB_LEASE_SECONDS)
             pct = round(10.0 + (current_page / max(1, total_pages)) * 85.0, 1)

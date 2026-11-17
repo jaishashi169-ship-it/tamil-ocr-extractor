@@ -31,6 +31,7 @@ def fingerprint(doc, font):
 
 def page_profile(page, cache, known):
     targets = []
+    has_latha = False
     for font in page.get_fonts():
         family = font[3].split("+")[-1]
         if family not in {"Latha", "Latha,Bold", "SunTommy"}:
@@ -38,11 +39,15 @@ def page_profile(page, cache, known):
         if font[0] not in cache:
             cache[font[0]] = fingerprint(page.parent, font)
         record = cache[font[0]]
-        if not record or record[0] not in known:
-            return False
-        if family.startswith("Latha") and font[2] == "Type0":
-            targets.append(record[1])
-    return bool(targets)
+        if not record:
+            continue
+        if record[0] in known or (family.startswith("Latha") and font[2] == "Type0" and font[5] == "Identity-H"):
+            if family.startswith("Latha") and font[2] == "Type0":
+                targets.append(record[1])
+                has_latha = True
+            elif family == "SunTommy":
+                targets.append(record[1])
+    return bool(targets if has_latha else targets)
 
 
 def repaired_copy(page):

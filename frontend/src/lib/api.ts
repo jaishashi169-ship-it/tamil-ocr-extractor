@@ -178,7 +178,8 @@ export async function uploadFileInChunks(
 
   const token = await ensureAuthToken();
   let sessionId = callbacks.resumeSessionId;
-  let effectiveChunkSize = CHUNK_SIZE_BYTES;
+  const targetChunkSize = file.size > 50_000_000 ? 10_485_760 : (file.size > 20_000_000 ? 8_388_608 : CHUNK_SIZE_BYTES);
+  let effectiveChunkSize = targetChunkSize;
   let totalChunks = Math.max(1, Math.ceil(file.size / effectiveChunkSize));
   let receivedSet = new Set<number>();
   let uploadMode: "proxy" | "direct_s3" | "vercel_blob" = "proxy";
@@ -241,11 +242,11 @@ export async function uploadFileInChunks(
       body: JSON.stringify({
         filename: file.name,
         expected_size_bytes: file.size,
-        chunk_size_bytes: CHUNK_SIZE_BYTES,
+        chunk_size_bytes: targetChunkSize,
       }),
     });
     sessionId = initRes.session_id;
-    effectiveChunkSize = initRes.chunk_size_bytes || CHUNK_SIZE_BYTES;
+    effectiveChunkSize = initRes.chunk_size_bytes || targetChunkSize;
     totalChunks = initRes.total_chunks;
     uploadMode = initRes.upload_mode || "proxy";
     storageKey = initRes.storage_key || "";
