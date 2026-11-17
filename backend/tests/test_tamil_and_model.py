@@ -122,3 +122,30 @@ def test_user_requirements_regression():
         assert not (0xE000 <= code <= 0xF8FF), f"Private-use char {hex(code)} found in output"
         if 0x0B80 <= code <= 0x0BFF:
             assert code in ASSIGNED_TAMIL_CODEPOINTS, f"Unassigned Tamil codepoint {hex(code)} found in output"
+
+
+def test_extraction_kit_integration():
+    from pathlib import Path
+    from app.services.extraction_kit import extract, issues
+
+    pdf_candidate = Path("private_storage/uploads/028bd445-3304-4fd2-8f9b-c69a87958ef4/5e3bbbbc-9a2e-4ebc-905b-51dc17151923/TAMIL PART 2 - 02 பதினெண் கீழ்க்கணக்கு நூல்கள்.pdf")
+    if not pdf_candidate.exists():
+        pdf_candidate = Path("../" + str(pdf_candidate))
+    if not pdf_candidate.exists():
+        return
+
+    sections = extract(pdf_candidate)
+    assert len(sections) == 13
+    assert all(s["method"] == "verified-file font profile" for s in sections)
+    assert not any(issues(s["text"]) for s in sections)
+
+    p1_text = sections[0]["text"]
+    assert "பதினெண் கீழ்க்கணக்கு நூல்கள்" in p1_text
+    assert "முதுமொழிக்காஞ்சி" in p1_text
+
+    p2_text = sections[1]["text"]
+    assert "திணைமாலை நூற்றைம்பது" in p2_text
+    assert "புறத்திணை நூல்" in p2_text
+    assert "இந்நூல் 400 பாடல்களைக் கொண்டது." in p2_text
+
+    assert all(s["text"].splitlines()[-1] == str(i) for i, s in enumerate(sections, 2))

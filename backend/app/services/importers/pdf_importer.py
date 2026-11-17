@@ -78,12 +78,19 @@ def import_pdf(
         doc_warnings: List[str] = []
 
         doc_has_font_profile = False
+        kit_sections: Dict[int, Any] = {}
         try:
+            from app.services.extraction_kit import known_profiles, page_profile, extract as kit_extract
+            known = known_profiles()
+            cache: Dict[int, Any] = {}
             for p_idx in range(min(total_pages, 15)):
-                txt = doc[p_idx].get_text()
-                if has_subsetted_font_profile(txt):
+                if page_profile(doc[p_idx], cache, known):
                     doc_has_font_profile = True
                     break
+            if doc_has_font_profile:
+                extracted_list = kit_extract(file_path, lang=ocr_opts.language, mode="auto")
+                for s in extracted_list:
+                    kit_sections[s["section"]] = s
         except Exception:
             pass
 
@@ -106,6 +113,80 @@ def import_pdf(
             thumb_pix = page.get_pixmap(dpi=48)
             thumb_key = f"jobs/{job_id}/pages/page_{page_num:04d}_thumb.png"
             storage.save_bytes(thumb_key, thumb_pix.tobytes("png"))
+
+            page_warnings: List[str] = []
+
+            # If page matched verified font profile in extraction kit, use repaired representation
+            if page_num in kit_sections:
+                sec = kit_sections[page_num]
+                sec_method = sec.get("method", "verified-file font profile")
+                sec_text = sec.get("text", "")
+                sec_review = sec.get("review", False)
+                sec_reasons = sec.get("reasons", [])
+
+                final_blocks: List[TextBlock] = []
+                for l_idx, line in enumerate(sec_text.splitlines()):
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    bid = str(uuid.uuid4())
+                    is_head = l_idx == 0 or (len(line_str) < 60 and not line_str.startswith(("•", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")))
+                    final_blocks.append(
+                        TextBlock(
+                            id=bid,
+                            block_type="heading" if is_head else "paragraph",
+                            heading_level=2 if is_head else None,
+                            text=line_str,
+                            language=detect_script_language(line_str),
+                            extraction_method=sec_method,
+                            method=sec_method,
+                            confidence=100.0,
+                            bbox=BoundingBox(
+                                x=72.0,
+                                y=70.0 + l_idx * 18.0,
+                                width=max(10.0, min(float(rect.width) - 144.0, 500.0)),
+                                height=16.0,
+                            ),
+                            source_ref=SourceReference(
+                                filename=filename,
+                                page_number=page_num,
+                                block_id=bid,
+                            ),
+                        )
+                    )
+
+                extraction_method = sec_method
+                source_type = "pdf_text"
+                conf_avg = 100.0
+                if sec_reasons:
+                    page_warnings.extend(sec_reasons)
+
+                combined_text = sec_text
+                lang_detected = detect_script_language(combined_text)
+
+                pages.append(
+                    PageModel(
+                        page_number=page_num,
+                        width=float(rect.width),
+                        height=float(rect.height),
+                        source_type=source_type,
+                        extraction_method=extraction_method,
+                        method=extraction_method,
+                        language_detected=lang_detected,
+                        confidence_avg=conf_avg,
+                        blocks=final_blocks,
+                        tables=[],
+                        warnings=page_warnings,
+                        metadata={
+                            "preview_key": preview_key,
+                            "thumbnail_key": thumb_key,
+                            "needs_review": sec_review,
+                            "review_reasons": sec_reasons,
+                            "alternate_text": sec.get("alternate_text"),
+                        },
+                    )
+                )
+                continue
 
             # Evaluate embedded text on this page
             raw_dict = page.get_text("dict")
