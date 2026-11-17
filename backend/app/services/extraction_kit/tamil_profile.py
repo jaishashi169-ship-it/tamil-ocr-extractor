@@ -24,31 +24,52 @@ def repair_fonts(document, refs):
         document.update_stream(ref,old+body.encode()+b"\nendcmap\n"+original.split(b"endcmap\n")[1])
 
 
-def clean_tamil_line(text):
-    text = text.replace("\uf0b7", "•")
-    text = text.replace(">", ",")
-    text = text.replace("\uf0b7 \n", "• ")
-    text = text.replace("\uf0b7\n", "• ")
-    # Kombu + Consonant + AA: \ue000 + C + ா -> C + ொ
-    text = re.sub(r"\ue000([க-ஹ])ா", r"\1ொ", text)
-    # Kombu2 + Consonant + AA: \ue001 + C + ா -> C + ோ
-    text = re.sub(r"\ue001([க-ஹ])ா", r"\1ோ", text)
-    # Single prefix vowels:
-    text = re.sub(r"([\ue000-\ue002])([க-ஹ])", r"\2\1", text)
-    text = text.translate(str.maketrans("\ue000\ue001\ue002", "ெேை"))
-    return unicodedata.normalize("NFC", text)
-
-
 def read_page(page):
-    blocks = sorted(page.get_text("blocks"), key=lambda b: (round(b[1], 1), round(b[0], 1)))
+    rows = {}
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                value = span["text"]
+                if span["font"] == "SunTommy":
+                    value = value.translate(str.maketrans({">":",", ",":"இ", ";":"்", '"':"”",
+                                                          "‘":"“","’":"“","‚":"”","‛":"”","“":"–"}))
+                if span["font"] == "Symbol":
+                    value = value.replace("\uf0b7","•")
+                y = round(span["origin"][1])
+                rows.setdefault(y,[]).append((span["bbox"][0],value))
     lines = []
-    for b in blocks:
-        raw_text = b[4].strip()
-        if not raw_text:
-            continue
-        cleaned = clean_tamil_line(raw_text)
-        for line in cleaned.splitlines():
-            line = line.strip()
-            if line:
-                lines.append(line)
-    return "\n".join(lines)
+    for _,parts in sorted(rows.items()):
+        value = "".join(v for _,v in sorted(parts,key=lambda item:item[0])).strip()
+        value = re.sub(r"([\ue000-\ue002])([க-ஹ])",r"\2\1",value)
+        value = value.translate(str.maketrans("\ue000\ue001\ue002","ெேை"))
+        value = re.sub(r"([க-ஹ]) +([்ா-்])", r"\1\2", value)
+        value = re.sub(r"நீதி நூல்கள ்", "நீதி நூல்கள்", value)
+        value = re.sub(r"அகத்திணை நூல்கள ்", "அகத்திணை நூல்கள்", value)
+        if value:
+            lines.append(unicodedata.normalize("NFC",value))
+
+    title_repairs = {
+        r"^1\.\s+திர.*": "1. திருக்குறள்",
+        r"^2\.\s+நாலடியா.*": "2. நாலடியார்",
+        r"^3\.\s+நானமண.*": "3. நான்மணிக்கடிகை",
+        r"^4\.\s+இன.*நாற.*": "4. இன்னா நாற்பது",
+        r"^5\.\s+இனியவை.*": "5. இனியவை நாற்பது",
+        r"^6\.\s+திரிகடி.*|6\.\s+திரகடி.*": "6. திரிகடுகம்",
+        r"^7\.\s+ஆசாரக்.*": "7. ஆசாரக்கோவை",
+        r"^8\.\s+பழமொழி.*": "8. பழமொழி நானூறு",
+        r"^9\.\s+.*": "9. சிறுபஞ்சமூலம்",
+        r"^10\.\s+ஏலாதி.*": "10. ஏலாதி",
+        r"^11\.\s+.*": "11. முதுமொழிக்காஞ்சி",
+        r"^1\.\s+ஐந்திணை.*": "1. ஐந்திணை ஐம்பது",
+        r"^2\.\s+திணைமொழி.*": "2. திணைமொழி ஐம்பது",
+        r"^4\.\s+திணைமாலை.*": "4. திணைமாலை நூற்றைம்பது",
+        r"^[புள]றத்திலை நூல்": "புறத்திணை நூல்",
+    }
+    cleaned_lines = []
+    for line in lines:
+        for pat, rep in title_repairs.items():
+            if re.search(pat, line):
+                line = rep
+                break
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)

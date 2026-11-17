@@ -49,7 +49,10 @@ export function resolveApiBase(
     return trimmed.endsWith("/api/v1") ? trimmed : `${trimmed}/api/v1`;
   }
   if (isLocalHost) {
-    return "http://localhost:8000/api/v1";
+    if (typeof window !== "undefined" && window.location.hostname) {
+      return `http://${window.location.hostname}:8000/api/v1`;
+    }
+    return "http://127.0.0.1:8000/api/v1";
   }
   throw new Error(
     "NEXT_PUBLIC_API_URL is not configured. Set NEXT_PUBLIC_API_URL to /api/v1 (same-origin service routing) or your HTTPS backend API base before building the frontend."
@@ -100,7 +103,20 @@ export async function ensureAuthToken(): Promise<string> {
     const requestEpoch = authEpoch;
     inFlightAuthEpoch = requestEpoch;
     inFlightAuthPromise = (async () => {
-      const res = await fetch(`${getApiBase()}/auth/guest`, { method: "POST" });
+      const apiBase = getApiBase();
+      let res: Response;
+      try {
+        res = await fetch(`${apiBase}/auth/guest`, { method: "POST" });
+      } catch {
+        const alt = apiBase.includes("localhost")
+          ? apiBase.replace("localhost", "127.0.0.1")
+          : apiBase.replace("127.0.0.1", "localhost");
+        try {
+          res = await fetch(`${alt}/auth/guest`, { method: "POST" });
+        } catch {
+          res = await fetch("/api/v1/auth/guest", { method: "POST" });
+        }
+      }
       if (!res.ok) {
         throw new Error("Unable to initialize studio session.");
       }
@@ -132,12 +148,37 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   const apiBase = getApiBase();
-  const res = await fetch(`${apiBase}${path}`, { ...init, headers });
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase}${path}`, { ...init, headers });
+  } catch {
+    const alt = apiBase.includes("localhost")
+      ? apiBase.replace("localhost", "127.0.0.1")
+      : apiBase.replace("127.0.0.1", "localhost");
+    try {
+      res = await fetch(`${alt}${path}`, { ...init, headers });
+    } catch {
+      res = await fetch(`/api/v1${path}`, { ...init, headers });
+    }
+  }
+
   if (res.status === 401 && typeof window !== "undefined") {
     clearStoredToken();
     const freshToken = await ensureAuthToken();
     headers.set("Authorization", `Bearer ${freshToken}`);
-    const retry = await fetch(`${apiBase}${path}`, { ...init, headers });
+    let retry: Response;
+    try {
+      retry = await fetch(`${apiBase}${path}`, { ...init, headers });
+    } catch {
+      const alt = apiBase.includes("localhost")
+        ? apiBase.replace("localhost", "127.0.0.1")
+        : apiBase.replace("127.0.0.1", "localhost");
+      try {
+        retry = await fetch(`${alt}${path}`, { ...init, headers });
+      } catch {
+        retry = await fetch(`/api/v1${path}`, { ...init, headers });
+      }
+    }
     if (!retry.ok) {
       const errBody = await retry.json().catch(() => ({}));
       throw new Error(errBody.detail || `Request failed (${retry.status})`);
@@ -320,11 +361,32 @@ export async function uploadFileInChunks(
         const formData = new FormData();
         formData.append("chunk", slice, `part_${idx}`);
 
-        const res = await fetch(`${getApiBase()}/uploads/${sessionId}/chunk/${idx}`, {
-          method: "PUT",
-          headers: { Authorization: `Bearer ${token}` },
-          body: formData,
-        });
+        const apiBase = getApiBase();
+        let res: Response;
+        try {
+          res = await fetch(`${apiBase}/uploads/${sessionId}/chunk/${idx}`, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${token}` },
+            body: formData,
+          });
+        } catch {
+          const alt = apiBase.includes("localhost")
+            ? apiBase.replace("localhost", "127.0.0.1")
+            : apiBase.replace("127.0.0.1", "localhost");
+          try {
+            res = await fetch(`${alt}/uploads/${sessionId}/chunk/${idx}`, {
+              method: "PUT",
+              headers: { Authorization: `Bearer ${token}` },
+              body: formData,
+            });
+          } catch {
+            res = await fetch(`/api/v1/uploads/${sessionId}/chunk/${idx}`, {
+              method: "PUT",
+              headers: { Authorization: `Bearer ${token}` },
+              body: formData,
+            });
+          }
+        }
         if (!res.ok) {
           const errBody = await res.json().catch(() => ({}));
           throw new Error(errBody.detail || `Chunk ${idx} upload failed`);

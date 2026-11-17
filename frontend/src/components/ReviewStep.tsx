@@ -492,6 +492,7 @@ export function ReviewStep({
             value={currentPage.edited_text}
             onChange={(e) => updatePageText(e.target.value, true)}
             rows={18}
+            dir="auto"
             aria-label="Editable extracted text"
             className="w-full flex-1 rounded-xl border border-slate-300 bg-white p-3.5 text-sm leading-relaxed text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           />

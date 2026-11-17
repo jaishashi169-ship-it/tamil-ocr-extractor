@@ -20,6 +20,26 @@ const nextConfig: NextConfig = {
     ],
   },
   ...(isCloudDeploy ? {} : { output: "standalone" }),
+  async rewrites() {
+    return [
+      {
+        source: "/api/v1/:path*",
+        destination: "http://127.0.0.1:8000/api/v1/:path*",
+      },
+      {
+        source: "/languages",
+        destination: "http://127.0.0.1:8000/languages",
+      },
+      {
+        source: "/extract",
+        destination: "http://127.0.0.1:8000/extract",
+      },
+      {
+        source: "/export",
+        destination: "http://127.0.0.1:8000/export",
+      },
+    ];
+  },
 };
 
 export default nextConfig;

@@ -36,6 +36,7 @@ interface UploadCardProps {
   onCancelItem: (localId: string) => void;
   onRetryItem: (localId: string) => void;
   onRemoveItem: (localId: string) => void;
+  onClearQueue?: () => void;
   onContinueToOptions: () => void;
   onAutoExtract?: (localId?: string) => void;
   isStarting?: boolean;
@@ -53,6 +54,7 @@ export function UploadCard({
   onCancelItem,
   onRetryItem,
   onRemoveItem,
+  onClearQueue,
   onContinueToOptions,
   onAutoExtract,
   isStarting = false,
@@ -232,9 +234,21 @@ export function UploadCard({
       {queue.length > 0 && (
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-              Upload Queue ({completedCount}/{queue.length})
-            </h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Upload Queue ({completedCount}/{queue.length})
+              </h3>
+              {onClearQueue && (
+                <button
+                  type="button"
+                  onClick={onClearQueue}
+                  className="rounded px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800"
+                  title="Clear all items from queue"
+                >
+                  Clear Queue
+                </button>
+              )}
+            </div>
             {completedCount > 0 && (
               <div className="flex items-center gap-2">
                 <button

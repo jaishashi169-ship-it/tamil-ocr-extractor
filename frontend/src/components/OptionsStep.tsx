@@ -45,6 +45,18 @@ export function OptionsStep({
 }: OptionsStepProps) {
   const { locale } = useStudio();
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [installedLanguages, setInstalledLanguages] = useState<Array<{ code: string; label: string }>>([]);
+
+  React.useEffect(() => {
+    fetch("/api/v1/languages")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => {
+        if (Array.isArray(data) && data.length > 0) {
+          setInstalledLanguages(data);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">
@@ -100,6 +112,29 @@ export function OptionsStep({
               </button>
             ))}
           </div>
+          {installedLanguages.length > 0 && (
+            <div className="mt-2.5">
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
+                Installed OCR recognition models:
+              </label>
+              <select
+                value={settings.language}
+                onChange={(e) => onChangeSettings({ ...settings, language: e.target.value })}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+              >
+                <option value="tam+eng">Tamil + English (tam+eng)</option>
+                <option value="tam">Tamil only (tam)</option>
+                <option value="eng">English only (eng)</option>
+                {installedLanguages
+                  .filter((l) => l.code !== "tam" && l.code !== "eng")
+                  .map((l) => (
+                    <option key={l.code} value={l.code}>
+                      {l.label} ({l.code})
+                    </option>
+                  ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* Document Style & Content Type */}

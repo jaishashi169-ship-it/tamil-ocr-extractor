@@ -1,5 +1,12 @@
+import os
 from functools import lru_cache
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_bundled_tess = Path(__file__).resolve().parent.parent / "tesseract" / "tesseract.exe"
+_default_tess_cmd = str(_bundled_tess) if _bundled_tess.is_file() else "tesseract"
+if _bundled_tess.is_file() and "TESSDATA_PREFIX" not in os.environ:
+    os.environ["TESSDATA_PREFIX"] = str(_bundled_tess.parent / "tessdata")
 
 
 class Settings(BaseSettings):
@@ -40,7 +47,7 @@ class Settings(BaseSettings):
     MAX_UPLOAD_BYTES: int = 400_000_000
     UPLOAD_CHUNK_BYTES: int = 5_242_880  # 5 MB proxy chunks
     S3_MULTIPART_PART_BYTES: int = 8_388_608  # 8 MiB direct multipart part size (>= 5 MiB minimum)
-    MAX_BATCH_FILES: int = 25
+    MAX_BATCH_FILES: int = 500
     MAX_PDF_PAGES: int = 5000
     MAX_IMAGE_PIXELS: int = 100_000_000
     JOB_TIMEOUT_SECONDS: int = 1800
@@ -59,7 +66,7 @@ class Settings(BaseSettings):
     CRON_SECRET: str = ""
 
     # Binaries
-    TESSERACT_CMD: str = "tesseract"
+    TESSERACT_CMD: str = _default_tess_cmd
     LIBREOFFICE_CMD: str = "soffice"
     ENABLE_ISOLATED_LIBREOFFICE: bool = True
 

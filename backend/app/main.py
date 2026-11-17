@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.database import Base, engine
-from app.routers import admin, auth, exports, jobs, pages, study, uploads
+from app.routers import admin, auth, exports, extractor, jobs, pages, study, uploads
 from app.routers.admin import evaluate_readiness
 
 settings = get_settings()
@@ -50,7 +50,11 @@ def readiness_check():
     return JSONResponse(status_code=200 if report["ready"] else 503, content=report)
 
 
+# Mount extractor at root for direct compatibility with test runners and workers
+app.include_router(extractor.router)
+
 API_PREFIX = "/api/v1"
+app.include_router(extractor.router, prefix=API_PREFIX)
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(uploads.router, prefix=API_PREFIX)
 app.include_router(jobs.router, prefix=API_PREFIX)

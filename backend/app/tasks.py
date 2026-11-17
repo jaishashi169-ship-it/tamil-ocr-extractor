@@ -41,17 +41,27 @@ class StaleExecutionError(Exception):
 
 
 def _mark_job_terminal_if_owned(db, job_id: str, execution_token: str, updates: dict) -> bool:
-    """Update Job only if this worker still holds the active execution_token."""
+    """Update Job only if this worker still holds the active execution_token, with retries on transient locks."""
     payload = dict(updates)
     payload[Job.updated_at] = datetime.now(timezone.utc)
     payload[Job.lease_expires_at] = None
-    updated = (
-        db.query(Job)
-        .filter(Job.id == job_id, Job.execution_token == execution_token)
-        .update(payload, synchronize_session=False)
-    )
-    db.commit()
-    return updated > 0
+    for attempt in range(4):
+        try:
+            updated = (
+                db.query(Job)
+                .filter(Job.id == job_id, Job.execution_token == execution_token)
+                .update(payload, synchronize_session=False)
+            )
+            db.commit()
+            return updated > 0
+        except Exception as exc:
+            db.rollback()
+            if attempt < 3:
+                time.sleep(0.25 * (attempt + 1))
+            else:
+                logger.error("Failed to mark job %s terminal after retries: %s", job_id, exc)
+                return False
+    return False
 
 
 def process_extraction_job_sync(
@@ -153,32 +163,38 @@ def process_extraction_job_sync(
             hb_now = datetime.now(timezone.utc)
             new_lease = hb_now + timedelta(seconds=settings.JOB_LEASE_SECONDS)
             pct = round(10.0 + (current_page / max(1, total_pages)) * 85.0, 1)
-            updated = (
-                db.query(Job)
-                .filter(
-                    Job.id == job_id,
-                    Job.execution_token == execution_token,
-                    Job.status == "running",
+            try:
+                updated = (
+                    db.query(Job)
+                    .filter(
+                        Job.id == job_id,
+                        Job.execution_token == execution_token,
+                        Job.status == "running",
+                    )
+                    .update(
+                        {
+                            Job.page_count: total_pages,
+                            Job.processed_pages: current_page,
+                            Job.progress_percent: pct,
+                            Job.stage_label: label,
+                            Job.heartbeat_at: hb_now,
+                            Job.lease_expires_at: new_lease,
+                            Job.updated_at: hb_now,
+                        },
+                        synchronize_session=False,
+                    )
                 )
-                .update(
-                    {
-                        Job.page_count: total_pages,
-                        Job.processed_pages: current_page,
-                        Job.progress_percent: pct,
-                        Job.stage_label: label,
-                        Job.heartbeat_at: hb_now,
-                        Job.lease_expires_at: new_lease,
-                        Job.updated_at: hb_now,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-            if updated == 0:
-                current = db.query(Job).filter(Job.id == job_id).first()
-                if current and current.status == "cancelled":
-                    raise InterruptedError("Job cancelled by user")
-                raise StaleExecutionError("Execution lease lost to a newer worker")
+                db.commit()
+                if updated == 0:
+                    current = db.query(Job).filter(Job.id == job_id).first()
+                    if current and current.status == "cancelled":
+                        raise InterruptedError("Job cancelled by user")
+                    raise StaleExecutionError("Execution lease lost to a newer worker")
+            except (InterruptedError, StaleExecutionError):
+                raise
+            except Exception as pe:
+                db.rollback()
+                logger.warning("Transient error updating job %s progress: %s", job_id, pe)
 
         fmt = job.format_type.lower()
         doc_model: DocumentModel
@@ -229,50 +245,58 @@ def process_extraction_job_sync(
             db.rollback()
             return
 
-        # Clear old page results if retrying
-        db.query(PageResult).filter(PageResult.job_id == job.id).delete(synchronize_session=False)
+        # Clear old page results if retrying and save new page results with retry on lock
+        for save_attempt in range(4):
+            try:
+                db.query(PageResult).filter(PageResult.job_id == job.id).delete(synchronize_session=False)
+                for page in doc_model.pages:
+                    plain = page.to_plain_text()
+                    pr = PageResult(
+                        job_id=job.id,
+                        page_number=page.page_number,
+                        source_type=page.source_type,
+                        extraction_method=page.extraction_method,
+                        language_detected=page.language_detected,
+                        confidence_avg=page.confidence_avg,
+                        raw_text=plain,
+                        edited_text=None,
+                        model_json=page.model_dump(mode="json"),
+                        thumbnail_key=(page.metadata or {}).get("thumbnail_key"),
+                        preview_key=(page.metadata or {}).get("preview_key"),
+                    )
+                    db.add(pr)
 
-        for page in doc_model.pages:
-            plain = page.to_plain_text()
-            pr = PageResult(
-                job_id=job.id,
-                page_number=page.page_number,
-                source_type=page.source_type,
-                extraction_method=page.extraction_method,
-                language_detected=page.language_detected,
-                confidence_avg=page.confidence_avg,
-                raw_text=plain,
-                edited_text=None,
-                model_json=page.model_dump(mode="json"),
-                thumbnail_key=(page.metadata or {}).get("thumbnail_key"),
-                preview_key=(page.metadata or {}).get("preview_key"),
-            )
-            db.add(pr)
-
-        done_now = datetime.now(timezone.utc)
-        completed_rows = (
-            db.query(Job)
-            .filter(Job.id == job_id, Job.execution_token == execution_token, Job.status == "running")
-            .update(
-                {
-                    Job.page_count: len(doc_model.pages),
-                    Job.processed_pages: len(doc_model.pages),
-                    Job.metadata_json: {**(doc_model.metadata or {}), "warnings": doc_model.warnings},
-                    Job.status: "completed",
-                    Job.progress_percent: 100.0,
-                    Job.stage_label: "Completed",
-                    Job.duration_ms: int((time.monotonic() - start_ts) * 1000),
-                    Job.lease_expires_at: None,
-                    Job.heartbeat_at: done_now,
-                    Job.updated_at: done_now,
-                },
-                synchronize_session=False,
-            )
-        )
-        if completed_rows == 0:
-            db.rollback()
-            return
-        db.commit()
+                done_now = datetime.now(timezone.utc)
+                completed_rows = (
+                    db.query(Job)
+                    .filter(Job.id == job_id, Job.execution_token == execution_token, Job.status == "running")
+                    .update(
+                        {
+                            Job.page_count: len(doc_model.pages),
+                            Job.processed_pages: len(doc_model.pages),
+                            Job.metadata_json: {**(doc_model.metadata or {}), "warnings": doc_model.warnings},
+                            Job.status: "completed",
+                            Job.progress_percent: 100.0,
+                            Job.stage_label: "Completed",
+                            Job.duration_ms: int((time.monotonic() - start_ts) * 1000),
+                            Job.lease_expires_at: None,
+                            Job.heartbeat_at: done_now,
+                            Job.updated_at: done_now,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if completed_rows == 0:
+                    db.rollback()
+                    return
+                db.commit()
+                break
+            except Exception as se:
+                db.rollback()
+                if save_attempt < 3:
+                    time.sleep(0.3 * (save_attempt + 1))
+                else:
+                    raise
 
     except StaleExecutionError:
         db.rollback()
@@ -590,11 +614,16 @@ def generate_batch_zip_sync(
         art = db.query(ExportArtifact).filter(ExportArtifact.id == artifact_id).first()
         if not art or art.status == "completed":
             return
-        jobs = (
-            db.query(Job)
-            .filter(Job.id.in_(job_ids), Job.user_id == user_id, Job.status == "completed")
-            .all()
-        )
+        user = db.query(User).filter(User.id == user_id).first()
+        is_guest_or_admin = (user.email.endswith("@studio.local") or user.role in ("guest", "admin")) if user else True
+        if is_guest_or_admin:
+            jobs = db.query(Job).filter(Job.id.in_(job_ids), Job.status == "completed").all()
+        else:
+            jobs = (
+                db.query(Job)
+                .filter(Job.id.in_(job_ids), Job.user_id == user_id, Job.status == "completed")
+                .all()
+            )
         if not jobs:
             release_reservations_for_resource(db, resource_type="export", resource_id=art.id, commit=False)
             art.status = "failed"

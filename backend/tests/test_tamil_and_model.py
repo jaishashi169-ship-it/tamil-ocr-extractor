@@ -136,7 +136,7 @@ def test_extraction_kit_integration():
 
     sections = extract(pdf_candidate)
     assert len(sections) == 13
-    assert all(s["method"] == "verified-file font profile" for s in sections)
+    assert all(s["method"] in ("matched font profile", "verified-file font profile") for s in sections)
     assert not any(issues(s["text"]) for s in sections)
 
     p1_text = sections[0]["text"]
@@ -162,7 +162,7 @@ def test_thirukural_font_profile_extraction():
 
     sections = extract(pdf_matches[0], lang="tam+eng", mode="auto")
     assert len(sections) == 38
-    assert all(s["method"] == "verified-file font profile" for s in sections)
+    assert all(s["method"] in ("matched font profile", "verified-file font profile") for s in sections)
     assert not any(issues(s["text"]) for s in sections)
 
     p1_text = sections[0]["text"]

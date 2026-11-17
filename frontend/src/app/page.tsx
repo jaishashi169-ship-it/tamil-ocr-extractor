@@ -210,7 +210,7 @@ export default function HomePage() {
 
     setIsStarting(true);
     try {
-      const batchId = ready.length > 1 ? `batch-${Date.now()}` : undefined;
+      const batchTimestamp = Date.now();
       const createdIds: string[] = [];
       let primaryJob: JobRecord | null = null;
 
@@ -224,15 +224,34 @@ export default function HomePage() {
         engine: effectiveDocType === "handwritten" ? "gemini" : (settings.engine || "auto"),
       };
 
-      for (const item of ready) {
-        const job = await createJob(
-          item.sessionId!,
-          effectiveSettings,
-          batchId,
-          password
-        );
-        createdIds.push(job.job_id);
-        if (!primaryJob) primaryJob = job;
+      for (let i = 0; i < ready.length; i++) {
+        const item = ready[i];
+        const batchChunk = Math.floor(i / 20);
+        const batchId = ready.length > 1 ? `batch-${batchTimestamp}-${batchChunk}` : undefined;
+        try {
+          const job = await createJob(
+            item.sessionId!,
+            effectiveSettings,
+            batchId,
+            password
+          );
+          createdIds.push(job.job_id);
+          if (!primaryJob) primaryJob = job;
+        } catch (itemErr: unknown) {
+          const errMsg = itemErr instanceof Error ? itemErr.message : "Failed to start extraction";
+          console.error(`Failed to create job for ${item.file.name}:`, itemErr);
+          setQueue((prev) =>
+            prev.map((q) =>
+              q.localId === item.localId
+                ? { ...q, status: "error", error: errMsg }
+                : q
+            )
+          );
+        }
+      }
+
+      if (createdIds.length === 0) {
+        return;
       }
 
       setBatchJobIds(createdIds);
@@ -256,19 +275,38 @@ export default function HomePage() {
 
     setIsStarting(true);
     try {
-      const batchId = ready.length > 1 ? `batch-${Date.now()}` : undefined;
+      const batchTimestamp = Date.now();
       const createdIds: string[] = [];
       let primaryJob: JobRecord | null = null;
 
-      for (const item of ready) {
-        const job = await createJob(
-          item.sessionId!,
-          { ...settings, workflow_action: selectedAction },
-          batchId,
-          password
-        );
-        createdIds.push(job.job_id);
-        if (!primaryJob) primaryJob = job;
+      for (let i = 0; i < ready.length; i++) {
+        const item = ready[i];
+        const batchChunk = Math.floor(i / 20);
+        const batchId = ready.length > 1 ? `batch-${batchTimestamp}-${batchChunk}` : undefined;
+        try {
+          const job = await createJob(
+            item.sessionId!,
+            { ...settings, workflow_action: selectedAction },
+            batchId,
+            password
+          );
+          createdIds.push(job.job_id);
+          if (!primaryJob) primaryJob = job;
+        } catch (itemErr: unknown) {
+          const errMsg = itemErr instanceof Error ? itemErr.message : "Failed to start extraction";
+          console.error(`Failed to create job for ${item.file.name}:`, itemErr);
+          setQueue((prev) =>
+            prev.map((q) =>
+              q.localId === item.localId
+                ? { ...q, status: "error", error: errMsg }
+                : q
+            )
+          );
+        }
+      }
+
+      if (createdIds.length === 0) {
+        return;
       }
 
       setBatchJobIds(createdIds);
@@ -473,6 +511,7 @@ export default function HomePage() {
             if (item) startChunkedUpload(item);
           }}
           onRemoveItem={(id) => setQueue((prev) => prev.filter((q) => q.localId !== id))}
+            onClearQueue={() => setQueue([])}
           onContinueToOptions={() => setStep("options")}
         />
       )}
@@ -520,8 +559,13 @@ export default function HomePage() {
           setActiveJob(retried);
         }}
         onDeleteJob={async (id) => {
-          await deleteJobNow(id);
-          refreshRecent();
+          try {
+            await deleteJobNow(id);
+          } catch (err) {
+            console.warn("Delete job error:", err);
+          } finally {
+            refreshRecent();
+          }
         }}
       />
     </div>

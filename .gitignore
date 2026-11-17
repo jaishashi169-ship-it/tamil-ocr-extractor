@@ -11,7 +11,12 @@ __pycache__/
 .pytest_cache/
 *.db
 *.sqlite*
+*.db-shm
+*.db-wal
 private_storage/
+completed_extractions/
+backend/poppler/
+backend/tesseract/
 
 # Node / Frontend
 node_modules/

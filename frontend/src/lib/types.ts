@@ -1,6 +1,6 @@
 export type WorkflowStep = "upload" | "options" | "review" | "download";
 export type WorkflowAction = "extract" | "convert" | "compress";
-export type OcrLanguage = "tam" | "eng" | "tam+eng";
+export type OcrLanguage = "tam" | "eng" | "tam+eng" | string;
 export type DocumentType = "printed" | "textbook" | "handwritten";
 export type OcrEngine = "auto" | "tesseract" | "gemini";
 export type QualityPreset = "original" | "high" | "balanced" | "smallest" | "custom";

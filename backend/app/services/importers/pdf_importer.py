@@ -81,12 +81,16 @@ def import_pdf(
         kit_sections: Dict[int, Any] = {}
         try:
             from app.services.extraction_kit import known_profiles, page_profile, extract as kit_extract
-            known = known_profiles()
-            cache: Dict[int, Any] = {}
-            for p_idx in range(min(total_pages, 15)):
-                if page_profile(doc[p_idx], cache, known):
-                    doc_has_font_profile = True
-                    break
+            has_rgb_fonts = any(f[3].split("+")[-1].startswith("RGB_") for p in doc for f in p.get_fonts())
+            if has_rgb_fonts:
+                doc_has_font_profile = True
+            else:
+                known = known_profiles()
+                cache: Dict[int, Any] = {}
+                for p_idx in range(min(total_pages, 15)):
+                    if page_profile(doc[p_idx], cache, known):
+                        doc_has_font_profile = True
+                        break
             if doc_has_font_profile:
                 extracted_list = kit_extract(file_path, lang=ocr_opts.language, mode="auto")
                 for s in extracted_list:
