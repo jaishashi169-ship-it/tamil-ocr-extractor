@@ -13,16 +13,23 @@ import {
   ArrowRightLeft,
   Minimize2,
   AlertCircle,
+  Zap,
+  BookOpen,
+  PenTool,
+  Printer,
+  Sparkles,
 } from "lucide-react";
 import { formatBytes } from "@/lib/api";
 import { t } from "@/lib/i18n";
-import { MAX_UPLOAD_BYTES, UploadQueueItem, WorkflowAction } from "@/lib/types";
+import { DocumentType, MAX_UPLOAD_BYTES, UploadQueueItem, WorkflowAction } from "@/lib/types";
 import { useStudio } from "./StudioContext";
 
 interface UploadCardProps {
   queue: UploadQueueItem[];
   selectedAction: WorkflowAction;
   onSelectAction: (action: WorkflowAction) => void;
+  selectedDocType?: DocumentType;
+  onSelectDocType?: (docType: DocumentType) => void;
   onAddFiles: (files: FileList | File[]) => void;
   onPauseItem: (localId: string) => void;
   onResumeItem: (localId: string) => void;
@@ -30,12 +37,16 @@ interface UploadCardProps {
   onRetryItem: (localId: string) => void;
   onRemoveItem: (localId: string) => void;
   onContinueToOptions: () => void;
+  onAutoExtract?: (localId?: string) => void;
+  isStarting?: boolean;
 }
 
 export function UploadCard({
   queue,
   selectedAction,
   onSelectAction,
+  selectedDocType = "textbook",
+  onSelectDocType,
   onAddFiles,
   onPauseItem,
   onResumeItem,
@@ -43,6 +54,8 @@ export function UploadCard({
   onRetryItem,
   onRemoveItem,
   onContinueToOptions,
+  onAutoExtract,
+  isStarting = false,
 }: UploadCardProps) {
   const { locale } = useStudio();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -57,6 +70,36 @@ export function UploadCard({
   };
 
   const completedCount = queue.filter((q) => q.status === "completed").length;
+
+  const docStyleCards: {
+    id: DocumentType;
+    title: string;
+    engine: string;
+    description: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }[] = [
+    {
+      id: "printed",
+      title: "Standard Printed",
+      engine: "Tesseract / Auto",
+      description: "Typed docs, letters, forms & digital papers",
+      icon: Printer,
+    },
+    {
+      id: "textbook",
+      title: "Textbooks & Guides",
+      engine: "Layout + Gutter Fix",
+      description: "School/college books, TNPSC guides, multi-column & gutter fix",
+      icon: BookOpen,
+    },
+    {
+      id: "handwritten",
+      title: "Handwritten Notes",
+      engine: "Stroke Enhancer + Vision AI",
+      description: "Tamil & English cursive, notebooks, exam answers & manuscripts",
+      icon: PenTool,
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -109,6 +152,55 @@ export function UploadCard({
         </p>
       </div>
 
+      {/* Document Style & Source Type Selector */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <label className="text-sm font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-indigo-500" />
+            <span>Document Style & Source Type</span>
+          </label>
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            Optimized OCR & Layout Pipeline
+          </span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {docStyleCards.map((card) => {
+            const Icon = card.icon;
+            const active = selectedDocType === card.id;
+            return (
+              <button
+                key={card.id}
+                type="button"
+                onClick={() => onSelectDocType?.(card.id)}
+                className={`relative flex flex-col items-start p-4 text-left rounded-xl border transition-all ${
+                  active
+                    ? "border-indigo-600 bg-indigo-50/70 ring-2 ring-indigo-500/20 dark:bg-indigo-950/50 dark:border-indigo-500"
+                    : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900 dark:hover:border-slate-700"
+                }`}
+              >
+                <div className="flex items-center justify-between w-full mb-2">
+                  <div className="flex items-center gap-2">
+                    <Icon className={`h-4 w-4 ${active ? "text-indigo-600 dark:text-indigo-400" : "text-slate-500"}`} />
+                    <span className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                      {card.title}
+                    </span>
+                  </div>
+                  {active && (
+                    <span className="h-2 w-2 rounded-full bg-indigo-600 dark:bg-indigo-400" />
+                  )}
+                </div>
+                <span className="inline-block rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300 mb-1.5">
+                  {card.engine}
+                </span>
+                <p className="text-xs text-slate-500 dark:text-slate-400 leading-snug">
+                  {card.description}
+                </p>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Three Simple Choices */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {[
@@ -123,7 +215,7 @@ export function UploadCard({
               key={item.id}
               type="button"
               onClick={() => onSelectAction(item.id)}
-              className={`flex items-center justify-center gap-2.5 rounded-xl border px-4 py-3.5 text-sm font-medium shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+              className={`flex items-center justify-center gap-2.5 rounded-xl border px-4 py-3 text-sm font-medium shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
                 active
                   ? "border-indigo-600 bg-indigo-50 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"
                   : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
@@ -139,18 +231,29 @@ export function UploadCard({
       {/* Batch Upload Queue */}
       {queue.length > 0 && (
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
               Upload Queue ({completedCount}/{queue.length})
             </h3>
             {completedCount > 0 && (
-              <button
-                type="button"
-                onClick={onContinueToOptions}
-                className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              >
-                {t(locale, "stepOptions")} →
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => onAutoExtract?.()}
+                  disabled={isStarting}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-700 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:from-indigo-700 hover:to-indigo-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
+                >
+                  <Zap className="h-4 w-4 fill-amber-300 text-amber-300" />
+                  <span>Auto Extract All ({completedCount})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onContinueToOptions}
+                  className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                >
+                  {t(locale, "stepOptions")} →
+                </button>
+              </div>
             )}
           </div>
 
@@ -207,10 +310,21 @@ export function UploadCard({
                       </button>
                     )}
                     {item.status === "completed" && (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2.5 py-0.5 text-xs font-medium text-teal-700 dark:bg-teal-950 dark:text-teal-300">
-                        <CheckCircle2 className="h-3.5 w-3.5" />
-                        Ready
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => onAutoExtract?.(item.localId)}
+                          disabled={isStarting}
+                          className="inline-flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-1 text-xs font-semibold text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
+                        >
+                          <Zap className="h-3 w-3 fill-amber-300 text-amber-300" />
+                          <span>Auto Extract Now</span>
+                        </button>
+                        <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700 dark:bg-teal-950 dark:text-teal-300">
+                          <CheckCircle2 className="h-3 w-3" />
+                          Ready
+                        </span>
+                      </div>
                     )}
                     <button
                       type="button"

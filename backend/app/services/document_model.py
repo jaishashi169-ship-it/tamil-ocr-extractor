@@ -24,7 +24,8 @@ class TextBlock(BaseModel):
     text: str
     raw_ocr_text: Optional[str] = None
     language: str = "unknown"  # tam | eng | tam+eng | unknown
-    extraction_method: Literal["direct", "ocr", "psd_text_layer", "user_edited", "gemini_vision"] = "direct"
+    extraction_method: str = "direct"
+    method: str = "direct"
     confidence: Optional[float] = None  # 0.0 to 100.0
     bbox: Optional[BoundingBox] = None
     font_name: Optional[str] = None
@@ -56,7 +57,8 @@ class PageModel(BaseModel):
     width: Optional[float] = None
     height: Optional[float] = None
     source_type: str = "unknown"  # pdf_text | pdf_scanned | pdf_mixed | image | psd | docx | text
-    extraction_method: Literal["direct", "ocr", "hybrid", "gemini_vision"] = "direct"
+    extraction_method: str = "direct"
+    method: str = "direct"
     language_detected: str = "unknown"
     confidence_avg: Optional[float] = None
     blocks: List[TextBlock] = Field(default_factory=list)

@@ -189,8 +189,65 @@ export default function HomePage() {
       return { localId, file, status: "pending", progressPercent: 0, uploadedBytes: 0 };
     });
 
+    // Intelligent document style auto-detection
+    const hasTextbookClues = incoming.some(f => /tnpsc|guide|book|school|பாடநூல்|கையேடு|notes/i.test(f.name));
+    const hasHandwrittenClues = incoming.some(f => /handwritten|cursive|notebook|exam|manuscript|எழுது/i.test(f.name));
+    if (hasHandwrittenClues) {
+      setSettings(prev => ({ ...prev, document_type: "handwritten", engine: "gemini", force_ocr: true }));
+    } else if (hasTextbookClues) {
+      setSettings(prev => ({ ...prev, document_type: "textbook", multi_column: true }));
+    }
+
     setQueue((prev) => [...prev, ...newItems]);
     newItems.filter((i) => i.status === "pending").forEach((i) => startChunkedUpload(i));
+  };
+
+  const handleAutoExtract = async (targetLocalId?: string) => {
+    const ready = targetLocalId
+      ? queue.filter((q) => q.localId === targetLocalId && q.status === "completed" && q.sessionId)
+      : queue.filter((q) => q.status === "completed" && q.sessionId);
+    if (ready.length === 0) return;
+
+    setIsStarting(true);
+    try {
+      const batchId = ready.length > 1 ? `batch-${Date.now()}` : undefined;
+      const createdIds: string[] = [];
+      let primaryJob: JobRecord | null = null;
+
+      const effectiveDocType = settings.document_type || "textbook";
+      const effectiveSettings: JobSettings = {
+        ...settings,
+        workflow_action: selectedAction,
+        document_type: effectiveDocType,
+        multi_column: effectiveDocType === "textbook" ? true : settings.multi_column,
+        force_ocr: effectiveDocType === "handwritten" ? true : settings.force_ocr,
+        engine: effectiveDocType === "handwritten" ? "gemini" : (settings.engine || "auto"),
+      };
+
+      for (const item of ready) {
+        const job = await createJob(
+          item.sessionId!,
+          effectiveSettings,
+          batchId,
+          password
+        );
+        createdIds.push(job.job_id);
+        if (!primaryJob) primaryJob = job;
+      }
+
+      setBatchJobIds(createdIds);
+      if (primaryJob) {
+        setActiveJob(primaryJob);
+        if (primaryJob.status === "completed") {
+          const pagesRes = await getJobPages(primaryJob.job_id);
+          setPages(pagesRes.pages);
+          setStep("review");
+        }
+      }
+      refreshRecent();
+    } finally {
+      setIsStarting(false);
+    }
   };
 
   const handleStartProcessing = async () => {
@@ -388,6 +445,18 @@ export default function HomePage() {
           queue={queue}
           selectedAction={selectedAction}
           onSelectAction={setSelectedAction}
+          selectedDocType={settings.document_type || "textbook"}
+          onSelectDocType={(dt) =>
+            setSettings((prev) => ({
+              ...prev,
+              document_type: dt,
+              multi_column: dt === "textbook" ? true : prev.multi_column,
+              force_ocr: dt === "handwritten" ? true : false,
+              engine: dt === "handwritten" ? "gemini" : "auto",
+            }))
+          }
+          onAutoExtract={handleAutoExtract}
+          isStarting={isStarting}
           onAddFiles={handleAddFiles}
           onPauseItem={(id) => {
             pauseFlags.current[id] = true;

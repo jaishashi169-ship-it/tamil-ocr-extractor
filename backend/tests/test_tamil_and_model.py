@@ -74,3 +74,51 @@ def test_indesign_and_legacy_tamil_auto_correction():
     for raw, expected in samples:
         res = normalize_unicode(raw)
         assert expected in res, f"Failed for '{raw}': got '{res}', expected '{expected}'"
+
+
+
+def test_user_requirements_regression():
+    from app.services.tamil_utils import ASSIGNED_TAMIL_CODEPOINTS, normalize_unicode
+
+    regression_cases = [
+        # 1. நீதி நூல்கள், item 11
+        ("ல௅ணுமொழிக்காஞ்சி", "முதுமொழிக்காஞ்சி"),
+        ("லணுமொழிக்காஞ்சி", "முதுமொழிக்காஞ்சி"),
+
+        # 2. அகத்திணை நூல்கள், item 1
+        ("஍ஐந்திணை ஍ஐம்பது", "ஐந்திணை ஐம்பது"),
+        ("ற்திணண ம்தணு", "ஐந்திணை ஐம்பது"),
+
+        # 3. அகத்திணை நூல்கள், item 2
+        ("திணணமொழி ஍ஐம்பது", "திணைமொழி ஐம்பது"),
+        ("திணணமொழி ஐம்பது", "திணைமொழி ஐம்பது"),
+
+        # 4. அகத்திணை நூல்கள், item 4
+        ("திணணமாலை ணெற்ணறஐம்பது", "திணைமாலை நூற்றைம்பது"),
+
+        # 5. Next section heading
+        ("ளுறத்திலை நூல்", "புறத்திணை நூல்"),
+
+        # 6. நாலடியார் paragraph: கொண்டணு -> கொண்டது without breaking valid ணு words
+        ("இந்நூல் 400 பாடல்களைக் கொண்டணு.", "இந்நூல் 400 பாடல்களைக் கொண்டது."),
+        ("அணு ஆராய்ச்சி மற்றும் நுணுக்கம்", "அணு ஆராய்ச்சி மற்றும் நுணுக்கம்"),
+
+        # 7. Symbol font bullet decoding
+        ("\uf0b7 திருக்குறள்", "• திருக்குறள்"),
+
+        # 8. Opening verse punctuation: > -> ,
+        ('"நாலடி>நால்மணி>நா நாற்தணு>ற்திணண>லப்"', '"நாலடி, நான்மணி, நானாற்பது, ஐந்திணை, முப்பால்"'),
+    ]
+
+    for raw, expected in regression_cases:
+        res = normalize_unicode(raw)
+        assert expected in res or res == expected, f"Failed for {raw}: got {res}, expected {expected}"
+
+    # Test that unassigned Tamil codepoints (U+0B80..U+0BFF) and private-use (U+E000..U+F8FF) are cleaned
+    sample_with_unassigned = "\u0ba1\u0ba2\u0ba5\uf0b7\uf0a7\u0b84\u0bc3\u0bce"
+    cleaned = normalize_unicode(sample_with_unassigned)
+    for ch in cleaned:
+        code = ord(ch)
+        assert not (0xE000 <= code <= 0xF8FF), f"Private-use char {hex(code)} found in output"
+        if 0x0B80 <= code <= 0x0BFF:
+            assert code in ASSIGNED_TAMIL_CODEPOINTS, f"Unassigned Tamil codepoint {hex(code)} found in output"

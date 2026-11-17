@@ -16,7 +16,7 @@ from app.services.document_model import (
 )
 from app.services.importers import CorruptFileError, PasswordRequiredError, ProgressCallback
 from app.services.ocr_engine import OCROptions, run_ocr_on_image
-from app.services.tamil_utils import detect_script_language, normalize_unicode
+from app.services.tamil_utils import detect_script_language, has_subsetted_font_profile, normalize_unicode
 from app.storage import storage
 
 settings = get_settings()
@@ -77,6 +77,16 @@ def import_pdf(
         pages: List[PageModel] = []
         doc_warnings: List[str] = []
 
+        doc_has_font_profile = False
+        try:
+            for p_idx in range(min(total_pages, 15)):
+                txt = doc[p_idx].get_text()
+                if has_subsetted_font_profile(txt):
+                    doc_has_font_profile = True
+                    break
+        except Exception:
+            pass
+
         for idx in range(total_pages):
             page_num = idx + 1
             if page_range and page_num not in page_range:
@@ -133,7 +143,8 @@ def import_pdf(
                             heading_level=2 if is_heading else None,
                             text=block_text,
                             language=detect_script_language(block_text),
-                            extraction_method="direct",
+                            extraction_method="verified-file font profile" if doc_has_font_profile else "direct",
+                            method="verified-file font profile" if doc_has_font_profile else "direct",
                             confidence=100.0,
                             bbox=bbox,
                             font_name=font_name,
@@ -204,7 +215,7 @@ def import_pdf(
             )
 
             if not should_run_ocr:
-                extraction_method = "direct"
+                extraction_method = "verified-file font profile" if doc_has_font_profile else "direct"
                 source_type = "pdf_text"
                 final_blocks = embedded_blocks
                 conf_avg = 100.0
@@ -239,6 +250,7 @@ def import_pdf(
                     height=float(rect.height),
                     source_type=source_type,
                     extraction_method=extraction_method,
+                    method=extraction_method,
                     language_detected=lang_detected,
                     confidence_avg=conf_avg,
                     blocks=final_blocks,

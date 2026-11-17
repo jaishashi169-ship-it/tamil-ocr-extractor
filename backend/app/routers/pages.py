@@ -82,6 +82,7 @@ def get_job_pages(
                 "page_number": p.page_number,
                 "source_type": p.source_type,
                 "extraction_method": p.extraction_method,
+                "method": p.extraction_method,
                 "language_detected": p.language_detected,
                 "confidence_avg": p.confidence_avg,
                 "raw_text": normalize_unicode(p.raw_text) if p.raw_text else "",
