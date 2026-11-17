@@ -22,6 +22,33 @@ from app.storage import storage
 settings = get_settings()
 
 
+def _is_genuine_table(rows: List[List[str]]) -> bool:
+    """Validate that an extracted table is a genuine multi-column data grid, not a misdetected list/paragraph."""
+    if not rows or len(rows) < 2:
+        return False
+    num_cols = max(len(r) for r in rows)
+    if num_cols < 2:
+        return False
+    col_content_count = [0] * num_cols
+    total_cells = 0
+    non_empty_cells = 0
+    for row in rows:
+        for c_idx, cell in enumerate(row):
+            total_cells += 1
+            c_clean = cell.strip().strip(">|•*-– ")
+            if len(c_clean) >= 2:
+                non_empty_cells += 1
+                col_content_count[c_idx] += 1
+
+    # At least 2 columns must have non-trivial content in at least 2 rows
+    cols_with_content = sum(1 for count in col_content_count if count >= 2)
+    if cols_with_content < 2:
+        return False
+    if total_cells > 0 and (non_empty_cells / total_cells) < 0.35:
+        return False
+    return True
+
+
 def import_pdf(
     file_path: Path,
     job_id: str,
@@ -120,13 +147,13 @@ def import_pdf(
                         )
                     )
 
-            # Detect tables via PyMuPDF find_tables if available
+            # Detect tables via PyMuPDF find_tables with strict structural validation
             page_tables: List[TableModel] = []
             try:
                 tab_finder = page.find_tables()
                 for t in tab_finder.tables:
-                    rows = [[normalize_unicode(str(c or "")) for c in row] for row in t.extract()]
-                    if rows:
+                    rows = [[normalize_unicode(str(c or "")).strip() for c in row] for row in t.extract()]
+                    if rows and _is_genuine_table(rows):
                         tid = str(uuid.uuid4())
                         page_tables.append(
                             TableModel(
@@ -136,6 +163,17 @@ def import_pdf(
                                 source_ref=SourceReference(filename=filename, page_number=page_num, block_id=tid),
                             )
                         )
+                        # Remove text blocks that fall inside this genuine table's bbox to avoid duplicate text
+                        t_box = t.bbox
+                        embedded_blocks = [
+                            b for b in embedded_blocks
+                            if not (
+                                b.bbox.x >= t_box[0] - 5
+                                and b.bbox.y >= t_box[1] - 5
+                                and (b.bbox.x + b.bbox.width) <= t_box[2] + 5
+                                and (b.bbox.y + b.bbox.height) <= t_box[3] + 5
+                            )
+                        ]
             except Exception:
                 pass
 

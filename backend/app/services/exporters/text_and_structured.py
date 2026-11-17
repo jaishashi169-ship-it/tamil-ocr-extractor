@@ -49,7 +49,10 @@ def export_markdown(doc: DocumentModel, options: Dict[str, Any]) -> Tuple[bytes,
                 lines.append(txt)
             lines.append("")
         for tbl in page.tables:
-            if not tbl.rows:
+            if not tbl.rows or len(tbl.rows) < 2:
+                continue
+            non_empty_header = [c for c in tbl.rows[0] if c.strip()]
+            if len(non_empty_header) < 2:
                 continue
             header = tbl.rows[0]
             lines.append("| " + " | ".join(c.replace("|", "\\|") for c in header) + " |")

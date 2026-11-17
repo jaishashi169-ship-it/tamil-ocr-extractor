@@ -71,8 +71,18 @@ class PageModel(BaseModel):
             if b.text.strip():
                 parts.append(b.text.strip())
         for t in self.tables:
+            tbl_lines = []
             for row in t.rows:
-                parts.append(" | ".join(cell.strip() for cell in row))
+                non_empty = [cell.strip() for cell in row if cell.strip()]
+                if len(non_empty) >= 2:
+                    tbl_lines.append(" | ".join(non_empty))
+                elif len(non_empty) == 1:
+                    tbl_lines.append(non_empty[0])
+            if tbl_lines:
+                tbl_text = "\n".join(tbl_lines)
+                first_line = tbl_lines[0]
+                if not any(first_line in b.text for b in self.blocks if len(first_line) > 10):
+                    parts.append(tbl_text)
         return "\n\n".join(parts)
 
 
