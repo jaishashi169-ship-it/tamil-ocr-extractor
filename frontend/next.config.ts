@@ -21,22 +21,27 @@ const nextConfig: NextConfig = {
   },
   ...(isCloudDeploy ? {} : { output: "standalone" }),
   async rewrites() {
+    const backendUrl = (
+      process.env.BACKEND_URL ||
+      process.env.NEXT_PUBLIC_BACKEND_URL ||
+      "http://127.0.0.1:8000"
+    ).replace(/\/+$/, "");
     return [
       {
         source: "/api/v1/:path*",
-        destination: "http://127.0.0.1:8000/api/v1/:path*",
+        destination: `${backendUrl}/api/v1/:path*`,
       },
       {
         source: "/languages",
-        destination: "http://127.0.0.1:8000/languages",
+        destination: `${backendUrl}/languages`,
       },
       {
         source: "/extract",
-        destination: "http://127.0.0.1:8000/extract",
+        destination: `${backendUrl}/extract`,
       },
       {
         source: "/export",
-        destination: "http://127.0.0.1:8000/export",
+        destination: `${backendUrl}/export`,
       },
     ];
   },
